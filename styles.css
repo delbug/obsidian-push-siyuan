@@ -142,6 +142,14 @@
   background: var(--interactive-accent);
   transition: width 0.25s ease;
 }
+.si-push-progress-fill.si-push-progress-indeterminate {
+  animation: si-push-progress-pulse 1.2s ease-in-out infinite;
+}
+@keyframes si-push-progress-pulse {
+  0% { margin-left: 0%; opacity: 0.7; }
+  50% { margin-left: 50%; opacity: 1; }
+  100% { margin-left: 70%; opacity: 0.7; }
+}
 
 /* ── V2: 同步报告 ── */
 .si-push-search-modal ul.si-push-doc-list {

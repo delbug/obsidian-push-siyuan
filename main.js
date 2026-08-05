@@ -10,6 +10,8 @@ const {
   Plugin, PluginSettingTab, Setting, Notice, Modal,
   MarkdownView, TFile, TFolder, setIcon, FuzzySuggestModal
 } = require("obsidian");
+const fs = require("fs");
+const path = require("path");
 
 // ═══════════════════════════════════════════════════════════════════
 // 默认设置
@@ -32,12 +34,16 @@ const DEFAULT_SETTINGS = {
   rewriteWikilinks: true,
   // 思源官方建议统一放到 /assets/；子目录（如 sipush/）容易导致引用找不到
   assetsDirPath: "/assets/",
+  // vault 相对路径 → 思源 assets 路径（避免重复上传产生多份副本）
+  assetMap: {},
   // 一键同步默认动作：vault = 全库推送，current = 仅当前笔记
   oneClickAction: "vault",
   // 缓存笔记本列表，打开设置时无需每次点刷新才能看到名称
   notebookCache: [],
-  // 思源文档树最大深度（默认 6，给压平留余量；7 层下无法再创建子文档）
-  maxDocDepth: 6,
+  // 思源文档树最大深度（叶子文档可以在第 7 层；第 7 层下不能再建子文档）
+  maxDocDepth: 7,
+  // 推送时若已有文档的思源路径与当前规则不一致，自动迁到正确层级
+  realignDocPath: true,
   // 推送失败队列：修好 bug 后可一键重试
   failedQueue: [],
   // 可暂停/继续的推送任务断点
@@ -130,6 +136,8 @@ function stripSiTitle(text) {
   return text.replace(/^# .*\n/, "");
 }
 function utcSec() { return Math.floor(Date.now() / 1000); }
+/** 让出事件循环，保证进度条/状态栏能刷新 */
+function yieldUi() { return new Promise(r => setTimeout(r, 0)); }
 function formatTime(sec) {
   const d = new Date(sec * 1000);
   return d.toLocaleString("zh-CN", { hour12: false });
@@ -144,17 +152,22 @@ function stripFM(c) {
   );
 }
 
-/** 可内联预览的媒体：图片 / 音视频 → 用 ![](assets/...) 便于思源展示播放 */
-const INLINE_MEDIA_EXTS = new Set([
-  // 图片
+/** 图片：用 ![](assets/...)；音视频必须用 HTML，否则思源当图片加载会显示「找不到」 */
+const IMAGE_EXTS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tif", "tiff", "avif", "heic",
-  // 音频
+]);
+const AUDIO_EXTS = new Set([
   "mp3", "wav", "flac", "ogg", "m4a", "aac", "wma", "opus",
-  // 视频
+]);
+const VIDEO_EXTS = new Set([
   "mp4", "webm", "mov", "mkv", "avi", "m4v", "flv", "wmv",
 ]);
+const INLINE_MEDIA_EXTS = new Set([...IMAGE_EXTS, ...AUDIO_EXTS, ...VIDEO_EXTS]);
 function isRemoteUrl(p) { return /^https?:\/\//i.test(p) || /^data:/i.test(p) || /^siyuan:/i.test(p); }
 function isInlineMediaExt(ext) { return INLINE_MEDIA_EXTS.has((ext || "").toLowerCase()); }
+function isImageExt(ext) { return IMAGE_EXTS.has((ext || "").toLowerCase()); }
+function isAudioExt(ext) { return AUDIO_EXTS.has((ext || "").toLowerCase()); }
+function isVideoExt(ext) { return VIDEO_EXTS.has((ext || "").toLowerCase()); }
 function isMarkdownExt(ext) { return (ext || "").toLowerCase() === "md"; }
 /** 任意非 md 本地文件都视为需上传的资源（不限于白名单：pdf/音视频/office 等） */
 function isAssetFile(file) {
@@ -183,13 +196,26 @@ function normalizeAssetLinkPath(p) {
   // 思源 Markdown 引用不要带 %xx，空格等直接用净化后的文件名
   return s;
 }
-/** 按类型生成思源可识别的 Markdown 引用 */
+function extFromAssetPath(assetPath) {
+  const name = String(assetPath || "").split("/").pop() || "";
+  const m = name.match(/\.([a-z0-9]+)$/i);
+  return m ? m[1].toLowerCase() : "";
+}
+/** 按类型生成思源可识别的 Markdown / HTML 引用 */
 function formatAssetMarkdown(file, assetPath, alias) {
-  const name = (alias || file.basename || "file").replace(/[\[\]]/g, "");
-  const ext = (file.extension || "").toLowerCase();
+  const name = (alias || (file && file.basename) || "file").replace(/[\[\]]/g, "");
+  const ext = ((file && file.extension) || extFromAssetPath(assetPath) || "").toLowerCase();
   const path = normalizeAssetLinkPath(assetPath);
-  // 图片/音视频：内联，思源可预览或播放
-  if (isInlineMediaExt(ext)) return `![${name}](${path})`;
+  // 音频：必须用 <audio>，![]() 会被当成图片 → 「找不到」
+  if (isAudioExt(ext)) {
+    return `<audio controls="controls" src="${path}" data-src="${path}"></audio>`;
+  }
+  // 视频同理
+  if (isVideoExt(ext)) {
+    return `<video controls="controls" src="${path}" data-src="${path}"></video>`;
+  }
+  // 图片：内联预览
+  if (isImageExt(ext)) return `![${name}](${path})`;
   // PDF/文档/其它附件：可点击链接
   return `[${name}](${path})`;
 }
@@ -207,21 +233,88 @@ function parseWikiTarget(raw) {
 function decodeUriPath(p) {
   try { return decodeURIComponent(p); } catch { return p; }
 }
+
+/** SHA-256 十六进制；大附件去重用 */
+async function sha256Hex(buffer) {
+  if (!buffer) return "";
+  const hash = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** 从思源资源名解析上传时间戳 name-YYYYMMDDHHmmss-xxxxxx.ext */
+function parseSiYuanAssetTimestamp(name) {
+  const m = String(name || "").match(/-(\d{14})-[a-z0-9]{6,10}(\.[^.]+)?$/i);
+  if (!m) return 0;
+  const s = m[1];
+  const y = +s.slice(0, 4), mo = +s.slice(4, 6) - 1, d = +s.slice(6, 8);
+  const h = +s.slice(8, 10), mi = +s.slice(10, 12), se = +s.slice(12, 14);
+  const t = Date.UTC(y, mo, d, h, mi, se);
+  return Number.isFinite(t) ? t : 0;
+}
+
+function assetEarlinessMs(item) {
+  const fromName = parseSiYuanAssetTimestamp(item.name);
+  if (fromName) return fromName;
+  const u = Number(item.updated) || 0;
+  // readDir 的 updated 多为秒；也可能是毫秒
+  return u > 1e12 ? u : u * 1000;
+}
+
+function formatBytes(n) {
+  const x = Number(n) || 0;
+  if (x < 1024) return x + " B";
+  if (x < 1024 * 1024) return (x / 1024).toFixed(1) + " KB";
+  if (x < 1024 * 1024 * 1024) return (x / (1024 * 1024)).toFixed(1) + " MB";
+  return (x / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+}
+
+/** 去掉思源自动追加的 -YYYYMMDDHHmmss-xxxxxx，便于同族归组 */
+function stripSiYuanAssetId(name) {
+  return String(name || "").replace(/-\d{14}-[a-z0-9]{6,10}(\.[^.]+)$/i, "$1");
+}
+
+/** 去掉插件 uniqueAssetName 追加的短哈希 -xxxxxxxx */
+function stripPluginAssetHash(name) {
+  return String(name || "").replace(/-[a-f0-9]{8,12}(\.[^.]+)$/i, "$1");
+}
+
 /**
- * 上传文件名：短、无空格、无特殊字符。
- * 旧实现用整段路径 + 空格，思源侧常变成 assets/sipush/xxx%20yyy.mp3 导致找不到。
+ * 同内容重复上传后的文件名族键：
+ * - 普通：foo-ab12cd34-时间-id.png → foo.png（再归一化空格/下划线）
+ * - 思源内容哈希开头：同一 32 位 hex 前缀视为同族
+ * - 「14.00 千问」与「14.00_千问」必须归为同族
  */
-function uniqueAssetName(file) {
+function assetFamilyKey(name) {
+  let stripped = stripPluginAssetHash(stripSiYuanAssetId(name));
+  const extM = stripped.match(/(\.[^.]+)$/);
+  const ext = extM ? extM[1].toLowerCase() : "";
+  const m = stripped.match(/^([a-f0-9]{32})/i);
+  if (m) return m[1].toLowerCase() + ext;
+  return stripped
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+}
+
+/**
+ * 上传文件名：短、无空格；内容哈希优先（去重稳定），避免长 UUID 被 slice 截断后撞名。
+ */
+function uniqueAssetName(file, contentHashHex) {
   const ext = file.extension ? ("." + String(file.extension).toLowerCase()) : "";
-  // Obsidian 的 basename 本身不含扩展名；不要用 \.[^.]+$ 乱裁，否则 19.00_19.40 会被截断
   const rawBase = String(file.basename || "asset");
-  const base = safeTitle(rawBase)
+  let base = safeTitle(rawBase)
     .replace(/\s+/g, "_")
     .replace(/[^\w\u4e00-\u9fff._-]+/g, "_")
     .replace(/_+/g, "_")
-    .replace(/^_|_$/g, "")
-    .slice(0, 48) || "asset";
-  const hash = contentHash(file.path).slice(0, 8);
+    .replace(/^_|_$/g, "");
+  // UUID 类长名：保留末尾更有区分度的一段
+  if (base.length > 40) {
+    base = base.slice(0, 20) + "_" + base.slice(-12);
+  }
+  base = base || "asset";
+  const hash = String(contentHashHex || contentHash(file.path)).replace(/[^a-f0-9]/gi, "").slice(0, 12)
+    || contentHash(file.path).slice(0, 8);
   return `${base}-${hash}${ext}`;
 }
 function resolveAssetsDirPath(setting) {
@@ -360,6 +453,7 @@ class SiYuanApi {
 
   // ── 查找文档（带 updated 时间戳） ──
   async findDoc(pushId) {
+    if (!pushId) return null;
     const stmt =
       "SELECT b.id, b.hpath, b.box, b.updated FROM blocks b " +
       "JOIN attributes a ON a.block_id = b.id " +
@@ -367,6 +461,36 @@ class SiYuanApi {
       "AND b.type='d' ORDER BY b.updated DESC LIMIT 1";
     const d = await this.request("/api/query/sql", { stmt });
     return d && d.length > 0 ? d[0] : null;
+  }
+
+  /** 按笔记本 + 人类可读路径找文档，避免 createDocWithMd 重复建同名文档 */
+  async findDocByHPath(notebookId, hpath) {
+    if (!notebookId || !hpath) return null;
+    let p = String(hpath).trim().replace(/\\/g, "/");
+    if (!p.startsWith("/")) p = "/" + p;
+    p = p.replace(/\/+/g, "/");
+    // 优先官方 API
+    try {
+      const ids = await this.request("/api/filetree/getIDsByHPath", {
+        notebook: notebookId,
+        path: p,
+      });
+      const list = Array.isArray(ids) ? ids : (ids && ids.ids) || [];
+      if (list.length) return { id: list[0], hpath: p, box: notebookId };
+    } catch (e) { /* 旧版思源可能无此接口 */ }
+    // SQL 回退（精确 + 去掉末尾斜杠）
+    const escaped = p.replace(/'/g, "''");
+    const stmt =
+      "SELECT id, hpath, box, updated FROM blocks WHERE type='d' AND box='" +
+      notebookId.replace(/'/g, "''") +
+      "' AND (hpath='" + escaped + "' OR hpath='" + escaped.replace(/\/$/, "") +
+      "') ORDER BY updated DESC LIMIT 1";
+    try {
+      const d = await this.request("/api/query/sql", { stmt });
+      return d && d.length > 0 ? d[0] : null;
+    } catch (e) {
+      return null;
+    }
   }
 
   // ── 获取文档的同步元信息 ──
@@ -421,13 +545,26 @@ class SiYuanApi {
     const p = path ? path.replace(/^[\/]/, "") : "";
     return this.request("/api/filetree/removeDoc", { notebook: notebookId, path: p });
   }
+  async removeDocByID(id) {
+    if (!id) return null;
+    return this.request("/api/filetree/removeDocByID", { id });
+  }
+  async getHPathByID(id) {
+    if (!id) return null;
+    const d = await this.request("/api/filetree/getHPathByID", { id });
+    // 接口可能直接返回字符串，或包在对象里
+    if (typeof d === "string") return d;
+    if (d && typeof d === "object") return d.hpath || d.path || d.data || null;
+    return null;
+  }
   async removeBlock(id) { return this.request("/api/block/removeBlock", { id }); }
 
   // ── 上传资源到思源 assets ──
-  async uploadAsset(blob, fileName, assetsDirPath) {
+  async uploadAsset(blobOrFile, fileName, assetsDirPath) {
     const form = new FormData();
     form.append("assetsDirPath", resolveAssetsDirPath(assetsDirPath));
-    form.append("file[]", blob, fileName);
+    // 优先用 File，保留文件名与 MIME，大音视频更稳
+    form.append("file[]", blobOrFile, fileName);
     const headers = {};
     if (this.token) headers["Authorization"] = "Token " + this.token;
     let resp;
@@ -436,7 +573,15 @@ class SiYuanApi {
     } catch (e) {
       throw new Error("上传资源失败: " + e.message);
     }
-    const j = await resp.json();
+    if (!resp.ok) {
+      throw new Error("SiYuan upload HTTP " + resp.status + "（大文件可能被超时/网关拦截）");
+    }
+    let j;
+    try {
+      j = await resp.json();
+    } catch (e) {
+      throw new Error("SiYuan upload 响应非 JSON（常见于大文件超时）");
+    }
     if (j.code !== 0) throw new Error("SiYuan upload: " + (j.msg || "code=" + j.code));
     const map = (j.data && j.data.succMap) || {};
     const errFiles = (j.data && j.data.errFiles) || [];
@@ -444,7 +589,89 @@ class SiYuanApi {
       throw new Error("SiYuan upload errFiles: " + errFiles.join(", "));
     }
     const raw = map[fileName] || Object.values(map)[0] || null;
+    if (!raw) throw new Error("SiYuan upload 未返回资源路径: " + fileName);
     return normalizeAssetLinkPath(raw);
+  }
+
+  // ── 文件 / 资源池（去重用） ──
+  async readDir(path) {
+    const d = await this.request("/api/file/readDir", { path });
+    return Array.isArray(d) ? d : [];
+  }
+
+  async removeFile(path) {
+    return this.request("/api/file/removeFile", { path });
+  }
+
+  async findReplaceAssetPath(fromPath, toPath) {
+    const k = String(fromPath || "").replace(/^\/+/, "");
+    const r = String(toPath || "").replace(/^\/+/, "");
+    if (!k || !r || k === r) return { replaceCount: 0 };
+    // ids 必须传数组，否则思源端会 panic
+    return this.request("/api/search/findReplace", {
+      k,
+      r,
+      query: k,
+      ids: [],
+      method: 0,
+      paths: [],
+      replaceTypes: {
+        text: true,
+        imgText: true,
+        imgTitle: true,
+        imgSrc: true,
+        aText: true,
+        aTitle: true,
+        aHref: true,
+        code: true,
+        codeBlock: true,
+        htmlBlock: true,
+        inlineMemo: true,
+      },
+    });
+  }
+
+  async removeUnusedAsset(path) {
+    return this.request("/api/asset/removeUnusedAsset", { path });
+  }
+
+  async statAsset(path) {
+    // path 形如 assets/xxx.png
+    const d = await this.request("/api/asset/statAsset", { path });
+    return d || {};
+  }
+
+  /** getFile 返回原始字节，不能走 JSON request */
+  async getFileBinary(path) {
+    const headers = { "Content-Type": "application/json" };
+    if (this.token) headers["Authorization"] = "Token " + this.token;
+    let resp;
+    try {
+      resp = await fetch(this.url + "/api/file/getFile", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ path }),
+      });
+    } catch (e) {
+      throw new Error("读取思源文件失败: " + e.message);
+    }
+    if (resp.status === 202) {
+      let msg = "文件不存在或无法读取";
+      try {
+        const j = await resp.json();
+        if (j && j.msg) msg = j.msg;
+        else if (j && j.code) msg = "code=" + j.code;
+      } catch (e) { /* ignore */ }
+      throw new Error(msg + ": " + path);
+    }
+    if (!resp.ok) throw new Error("读取思源文件 HTTP " + resp.status + ": " + path);
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("application/json")) {
+      const j = await resp.json();
+      if (j && j.code && j.code !== 0) throw new Error((j.msg || "code=" + j.code) + ": " + path);
+      throw new Error("getFile 返回了 JSON 而非文件内容: " + path);
+    }
+    return await resp.arrayBuffer();
   }
 }
 
@@ -481,6 +708,333 @@ class ConflictModal extends Modal {
   }
   onClose() { this.contentEl.empty(); if (this._resolve) this._resolve("cancel"); }
   openAndResolve() { return new Promise(r => { this._resolve = r; this.open(); }); }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 思源资源池去重（快速：文件名族 + 大小；可选严格哈希）
+// ═══════════════════════════════════════════════════════════════════
+class AssetDedupModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.phase = "idle"; // idle | scanning | report | applying | done
+    this.plan = null;
+    this.applyResult = null;
+    // 默认快速：同族同大小即视为重复，不读全文哈希
+    this.strictHash = false;
+    this._progress = { current: 0, total: 0, message: "", detail: "", stats: "" };
+    this._progressEl = null;
+  }
+  onOpen() {
+    this.modalEl.addClass("si-push-wide-modal");
+    this.render();
+    this.startScan();
+  }
+  onClose() {
+    this.contentEl.empty();
+    if (this.plugin && this.plugin._assetDedupModal === this) this.plugin._assetDedupModal = null;
+    try { this.plugin.refreshStatusBar(); } catch (e) { /* ignore */ }
+  }
+
+  /** 接受字符串，或 { message, current, total, detail, stats } */
+  setProgress(info) {
+    if (typeof info === "string") {
+      this._progress.message = info;
+    } else if (info && typeof info === "object") {
+      if (info.message != null) this._progress.message = String(info.message);
+      if (info.detail != null) this._progress.detail = String(info.detail);
+      if (info.stats != null) this._progress.stats = String(info.stats);
+      if (typeof info.current === "number") this._progress.current = info.current;
+      if (typeof info.total === "number") this._progress.total = info.total;
+      if (info.reset) {
+        this._progress.current = info.current || 0;
+        this._progress.total = info.total || 0;
+        this._progress.detail = info.detail || "";
+        this._progress.stats = info.stats || "";
+        this._progress.message = info.message || this._progress.message;
+      }
+    }
+    this.refreshProgress();
+    const p = this._progress;
+    if (this.plugin && typeof this.plugin.setStatusBarText === "function") {
+      if (p.total > 0) {
+        this.plugin.setStatusBarText(`去重 ${Math.min(p.current, p.total)}/${p.total}`);
+      } else if (p.message) {
+        this.plugin.setStatusBarText(String(p.message).slice(0, 36));
+      }
+    }
+  }
+
+  refreshProgress() {
+    if (!this._progressEl) return;
+    this.fillProgress(this._progressEl);
+  }
+
+  fillProgress(box) {
+    box.empty();
+    const p = this._progress;
+    const busy = this.phase === "scanning" || this.phase === "applying";
+    box.createEl("p", { text: p.message || (busy ? "进行中…" : "准备中…") });
+    if (p.total > 0) {
+      const shown = Math.min(Math.max(0, p.current), p.total);
+      const pct = Math.min(100, Math.round((shown / p.total) * 100));
+      box.createEl("p", { text: `进度：${shown}/${p.total}（${pct}%）` });
+      const bar = box.createDiv({ cls: "si-push-progress-bar" });
+      const fill = bar.createDiv({ cls: "si-push-progress-fill" });
+      fill.style.width = pct + "%";
+    } else if (busy) {
+      const bar = box.createDiv({ cls: "si-push-progress-bar" });
+      const fill = bar.createDiv({ cls: "si-push-progress-fill si-push-progress-indeterminate" });
+      fill.style.width = "30%";
+    }
+    if (p.detail) {
+      box.createEl("p", { cls: "si-push-doc-preview", text: p.detail });
+    }
+    if (p.stats) {
+      box.createEl("p", { text: p.stats });
+    }
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("si-push-search-modal");
+    contentEl.addClass("si-push-control-modal");
+    contentEl.createEl("h2", { text: "🧹 思源资源池去重" });
+    contentEl.createEl("p", {
+      cls: "si-push-doc-preview",
+      text: "只删除「重复副本」：同文件名族且同大小（或严格哈希相同）时，保留最早一份，其余副本先尽量改文档引用再删除。不会清理「仅未被引用」的独立文件。",
+    });
+
+    this._progressEl = contentEl.createDiv({ cls: "si-push-control-status" });
+    this._progressEl.style.padding = "8px 0 12px";
+    this.fillProgress(this._progressEl);
+
+    if (this.phase === "idle" || this.phase === "report" || this.phase === "done") {
+      const mode = contentEl.createDiv({ cls: "si-push-conflict-actions" });
+      const label = mode.createEl("label");
+      label.style.display = "flex";
+      label.style.alignItems = "center";
+      label.style.gap = "8px";
+      label.style.margin = "8px 0";
+      const cb = label.createEl("input", { type: "checkbox" });
+      cb.checked = !!this.strictHash;
+      cb.onchange = () => { this.strictHash = !!cb.checked; };
+      label.createSpan({ text: "严格模式：同族同大小仍计算 SHA-256（更慢，更稳）" });
+    }
+
+    if (this.phase === "scanning" || this.phase === "applying") {
+      contentEl.createEl("p", {
+        cls: "si-push-doc-preview",
+        text: this.phase === "scanning"
+          ? "正在扫描：枚举 → 归组 → 比大小 → 查引用。请勿关闭，进度见上方。"
+          : "正在改引用并删除副本。请勿关闭，进度见上方。",
+      });
+      const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
+      const close = acts.createEl("button", { text: "关闭（后台继续）" });
+      close.onclick = () => this.close();
+      return;
+    }
+
+    if ((this.phase === "report" || this.phase === "done") && this.plan) {
+      const p = this.plan;
+      const summary = contentEl.createDiv({ cls: "si-push-control-status" });
+      summary.createEl("p", {
+        text: `资源 ${p.totalFiles} · 候选族内 ${p.candidateCount || 0} · 重复组 ${p.groups.length} · 可删重复副本 ${p.duplicateCount} · 文档中已引用的副本 ${p.referencedDupCount || 0} · 预计释放 ${formatBytes(p.bytesSaved)}` +
+          (p.mode === "strict" ? " · 严格哈希" : " · 快速模式"),
+      });
+      if (this.applyResult) {
+        summary.createEl("p", {
+          text: `已执行：改引用尝试 ${this.applyResult.replaced} · 删除重复副本 ${this.applyResult.deleted} · 失败 ${this.applyResult.failed}`,
+        });
+      }
+      const list = contentEl.createDiv({ cls: "si-push-history-list" });
+      list.style.maxHeight = "360px";
+      list.style.overflow = "auto";
+      const show = p.groups.slice(0, 40);
+      for (const g of show) {
+        const row = list.createDiv({ cls: "si-push-history-item" });
+        row.createEl("div", {
+          text: `${g.files.length} 份 · ${formatBytes(g.size)} · 保留 ${g.keep.name}`,
+        });
+        const refN = (g.remove || []).filter(x => x.referenced).length;
+        row.createEl("div", {
+          cls: "si-push-doc-preview",
+          text: `将删重复副本 ${g.remove.length}（文档已引用 ${refN}）：` + g.remove.map(f => f.name).join(" 、 "),
+        });
+      }
+      if (p.groups.length > show.length) {
+        contentEl.createEl("p", { text: `…其余 ${p.groups.length - show.length} 组已省略` });
+      }
+    }
+
+    const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
+    if (this.phase === "report" && this.plan && this.plan.groups.length) {
+      const go = acts.createEl("button", { text: "执行去重（只删重复副本）", cls: "mod-cta" });
+      go.onclick = () => this.startApply();
+      const rescan = acts.createEl("button", { text: "重新扫描" });
+      rescan.style.marginLeft = "8px";
+      rescan.onclick = () => this.startScan();
+    } else if (this.phase === "report" && this.plan && !this.plan.groups.length) {
+      const rescan = acts.createEl("button", { text: "重新扫描", cls: "mod-cta" });
+      rescan.onclick = () => this.startScan();
+    } else if (this.phase === "done") {
+      const rescan = acts.createEl("button", { text: "再扫一次", cls: "mod-cta" });
+      rescan.onclick = () => this.startScan();
+    }
+    const close = acts.createEl("button", { text: "关闭" });
+    close.style.marginLeft = "8px";
+    close.onclick = () => this.close();
+  }
+
+  async startScan() {
+    if (this.phase === "scanning" || this.phase === "applying") return;
+    this.phase = "scanning";
+    this.plan = null;
+    this.applyResult = null;
+    this._progress = { current: 0, total: 0, message: "开始扫描…", detail: "", stats: "" };
+    this.render();
+    try {
+      this.plan = await this.plugin.scanSiYuanAssetDuplicates({
+        onProgress: (info) => this.setProgress(info),
+        strictHash: !!this.strictHash,
+      });
+      this.phase = "report";
+      this.setProgress({
+        reset: true,
+        current: this.plan.groups.length,
+        total: this.plan.groups.length || 1,
+        message: this.plan.groups.length
+          ? `扫描完成：${this.plan.groups.length} 组重复，可删副本 ${this.plan.duplicateCount}（其中文档已引用 ${this.plan.referencedDupCount || 0}）`
+          : "扫描完成：未发现重复附件（不会删除任何文件）",
+        detail: "规则：仅删除重复副本；独立/唯一文件即使未被引用也保留",
+        stats: `资源 ${this.plan.totalFiles} · 可删重复副本 ${this.plan.duplicateCount} · 预计释放 ${formatBytes(this.plan.bytesSaved)}`,
+      });
+      this.render();
+      try { this.plugin.refreshStatusBar(); } catch (e) { /* ignore */ }
+    } catch (e) {
+      this.phase = "idle";
+      this.setProgress({ message: "扫描失败: " + e.message, current: 0, total: 0, detail: "" });
+      this.render();
+      new Notice("❌ 资源去重扫描失败: " + e.message, 8000);
+      try { this.plugin.refreshStatusBar(); } catch (err) { /* ignore */ }
+    }
+  }
+
+  async startApply() {
+    if (!this.plan || !this.plan.groups.length || this.phase === "applying") return;
+    this.phase = "applying";
+    const totalDups = this.plan.groups.reduce((n, g) => n + ((g.remove && g.remove.length) || 0), 0);
+    this._progress = {
+      current: 0,
+      total: Math.max(1, totalDups),
+      message: "开始执行去重…",
+      detail: "",
+      stats: `共 ${this.plan.groups.length} 组 · ${totalDups} 个副本`,
+    };
+    this.render();
+    try {
+      this.applyResult = await this.plugin.applySiYuanAssetDedup(this.plan, {
+        onProgress: (info) => this.setProgress(info),
+      });
+      this.phase = "done";
+      this.setProgress({
+        reset: true,
+        current: this.applyResult.deleted + this.applyResult.failed,
+        total: totalDups || 1,
+        message: `去重完成：删除重复副本 ${this.applyResult.deleted} 个`,
+        detail: "",
+        stats: `改引用尝试 ${this.applyResult.replaced} · 失败 ${this.applyResult.failed}`,
+      });
+      this.render();
+      new Notice(`✅ 资源去重完成：删重复副本 ${this.applyResult.deleted} · 改引用 ${this.applyResult.replaced}`, 8000);
+      try { this.plugin.refreshStatusBar(); } catch (e) { /* ignore */ }
+    } catch (e) {
+      this.phase = "report";
+      this.setProgress({ message: "执行失败: " + e.message, detail: "" });
+      this.render();
+      new Notice("❌ 资源去重执行失败: " + e.message, 8000);
+      try { this.plugin.refreshStatusBar(); } catch (err) { /* ignore */ }
+    }
+  }
+}
+
+/** 通用长时间任务进度弹窗（修复/清理等） */
+class AssetOpProgressModal extends Modal {
+  constructor(app, plugin, title) {
+    super(app);
+    this.plugin = plugin;
+    this.titleText = title || "进行中";
+    this._progress = { current: 0, total: 0, message: "准备中…", detail: "", stats: "" };
+    this._progressEl = null;
+    this._done = false;
+    this._resultText = "";
+  }
+  onOpen() {
+    this.modalEl.addClass("si-push-wide-modal");
+    this.render();
+  }
+  onClose() {
+    this.contentEl.empty();
+    try { this.plugin.refreshStatusBar(); } catch (e) { /* ignore */ }
+  }
+  setProgress(info) {
+    if (typeof info === "string") {
+      this._progress.message = info;
+    } else if (info && typeof info === "object") {
+      if (info.message != null) this._progress.message = String(info.message);
+      if (info.detail != null) this._progress.detail = String(info.detail);
+      if (info.stats != null) this._progress.stats = String(info.stats);
+      if (typeof info.current === "number") this._progress.current = info.current;
+      if (typeof info.total === "number") this._progress.total = info.total;
+    }
+    if (!this._progressEl) this.render();
+    else this.fillProgress(this._progressEl);
+    const p = this._progress;
+    if (this.plugin && typeof this.plugin.setStatusBarText === "function") {
+      if (p.total > 0) this.plugin.setStatusBarText(`${this.titleText} ${Math.min(p.current, p.total)}/${p.total}`);
+      else if (p.message) this.plugin.setStatusBarText(String(p.message).slice(0, 36));
+    }
+  }
+  markDone(text) {
+    this._done = true;
+    this._resultText = text || "已完成";
+    this._progress.message = this._resultText;
+    this.render();
+  }
+  fillProgress(box) {
+    box.empty();
+    const p = this._progress;
+    box.createEl("p", { text: p.message || "进行中…" });
+    if (p.total > 0) {
+      const shown = Math.min(Math.max(0, p.current), p.total);
+      const pct = Math.min(100, Math.round((shown / p.total) * 100));
+      box.createEl("p", { text: `进度：${shown}/${p.total}（${pct}%）` });
+      const bar = box.createDiv({ cls: "si-push-progress-bar" });
+      const fill = bar.createDiv({ cls: "si-push-progress-fill" });
+      fill.style.width = pct + "%";
+    } else if (!this._done) {
+      const bar = box.createDiv({ cls: "si-push-progress-bar" });
+      bar.createDiv({ cls: "si-push-progress-fill si-push-progress-indeterminate" }).style.width = "30%";
+    }
+    if (p.detail) box.createEl("p", { cls: "si-push-doc-preview", text: p.detail });
+    if (p.stats) box.createEl("p", { text: p.stats });
+  }
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("si-push-search-modal");
+    contentEl.addClass("si-push-control-modal");
+    contentEl.createEl("h2", { text: this.titleText });
+    this._progressEl = contentEl.createDiv({ cls: "si-push-control-status" });
+    this._progressEl.style.padding = "8px 0 12px";
+    this.fillProgress(this._progressEl);
+    if (!this._done) {
+      contentEl.createEl("p", { cls: "si-push-doc-preview", text: "任务进行中，进度见上方；关闭弹窗不会中断（若已在跑）。" });
+    }
+    const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
+    acts.createEl("button", { text: this._done ? "关闭" : "关闭弹窗", cls: this._done ? "mod-cta" : "" }).onclick = () => this.close();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -525,13 +1079,15 @@ class SyncReportModal extends Modal {
 
     const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
     if (this.plugin) {
-      const back = acts.createEl("button", { text: "← 返回推送控制台", cls: "mod-cta" });
-      back.onclick = () => { this.close(); this.plugin.openPushControl(); };
+      addBackToControlButton(acts, this, this.plugin);
       const b1 = acts.createEl("button", { text: "📋 查看失败队列" });
       b1.onclick = () => { this.close(); this.plugin.openPushHistory(); };
       if (failN > 0) {
         const b2 = acts.createEl("button", { text: "🔁 重试失败项" });
-        b2.onclick = () => { this.close(); this.plugin.retryFailedQueue(); };
+        b2.onclick = () => {
+          this.close();
+          window.setTimeout(() => this.plugin.retryFailedQueue(), 50);
+        };
       }
     }
     const cb = acts.createEl("button", { text: "关闭" });
@@ -608,14 +1164,13 @@ class PushHistoryModal extends Modal {
     }
 
     const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
-    const back = acts.createEl("button", { text: "← 返回推送控制台", cls: "mod-cta" });
-    back.onclick = () => {
-      this.close();
-      this.plugin.openPushControl();
-    };
+    addBackToControlButton(acts, this, this.plugin);
     if (queue.length) {
       const retry = acts.createEl("button", { text: "🔁 重试全部失败项" });
-      retry.onclick = () => { this.close(); this.plugin.retryFailedQueue(); };
+      retry.onclick = () => {
+        this.close();
+        window.setTimeout(() => this.plugin.retryFailedQueue(), 50);
+      };
       const exp = acts.createEl("button", { text: "📝 导出失败列表到笔记" });
       exp.onclick = async () => {
         await this.plugin.exportFailedReport();
@@ -636,48 +1191,144 @@ class PushHistoryModal extends Modal {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 选择文件夹推送
+// 通用：返回推送控制台
 // ═══════════════════════════════════════════════════════════════════
-class FolderSuggestModal extends FuzzySuggestModal {
-  constructor(app, onChoose) {
-    super(app);
-    this.onChooseCb = onChoose;
-    this.setPlaceholder("选择要推送的文件夹…");
+function goBackToPushControl(modal, plugin) {
+  if (modal) modal.close();
+  if (plugin && typeof plugin.openPushControl === "function") {
+    window.setTimeout(() => plugin.openPushControl(), 0);
   }
-  getItems() {
-    // 不依赖 getAllLoadedFiles，从 md 文件反推文件夹，兼容性更好
+}
+function addBackToControlButton(actsEl, modal, plugin, opts) {
+  opts = opts || {};
+  const back = actsEl.createEl("button", {
+    text: opts.text || "← 返回推送控制台",
+    cls: opts.cta === false ? "" : "mod-cta",
+  });
+  back.onclick = () => goBackToPushControl(modal, plugin);
+  return back;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 选择文件夹 / 从指定位置重推（带返回控制台）
+// ═══════════════════════════════════════════════════════════════════
+class PathPickModal extends Modal {
+  constructor(app, plugin, opts) {
+    super(app);
+    this.plugin = plugin;
+    this.titleText = (opts && opts.title) || "请选择";
+    this.hint = (opts && opts.hint) || "";
+    this.items = (opts && opts.items) || []; // [{ text, value }]
+    this.onChooseCb = opts && opts.onChoose;
+    this.filter = "";
+    this._listEl = null;
+  }
+  onOpen() {
+    this.modalEl.addClass("si-push-wide-modal");
+    this.render();
+  }
+  filteredItems() {
+    const q = (this.filter || "").trim().toLowerCase();
+    if (!q) return this.items;
+    return this.items.filter(it => (it.text || "").toLowerCase().includes(q));
+  }
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("si-push-search-modal");
+    contentEl.createEl("h2", { text: this.titleText });
+    if (this.hint) contentEl.createEl("p", { cls: "si-push-doc-preview", text: this.hint });
+
+    const inp = contentEl.createEl("input", {
+      type: "text",
+      placeholder: "筛选…",
+      cls: "si-push-tree-search",
+    });
+    Object.assign(inp.style, { width: "100%", margin: "8px 0", padding: "8px" });
+    inp.value = this.filter;
+    inp.oninput = () => {
+      this.filter = inp.value;
+      this.renderList();
+    };
+
+    this._listEl = contentEl.createEl("ul", { cls: "si-push-doc-list" });
+    this._listEl.style.maxHeight = "50vh";
+    this._listEl.style.overflowY = "auto";
+    this.renderList();
+
+    const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
+    acts.style.marginTop = "12px";
+    addBackToControlButton(acts, this, this.plugin);
+    const close = acts.createEl("button", { text: "关闭" });
+    close.onclick = () => this.close();
+    inp.focus();
+  }
+  renderList() {
+    if (!this._listEl) return;
+    this._listEl.empty();
+    const list = this.filteredItems();
+    if (!list.length) {
+      this._listEl.createEl("li", { cls: "si-push-search-hint", text: "没有匹配项" });
+      return;
+    }
+    for (const it of list) {
+      const li = this._listEl.createEl("li", { cls: "si-push-doc-item" });
+      li.createEl("div", { text: it.text, cls: "si-push-doc-path" });
+      li.onclick = () => {
+        this.close();
+        if (this.onChooseCb) this.onChooseCb(it.value);
+      };
+    }
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class FolderSuggestModal {
+  /** 兼容旧调用：new FolderSuggestModal(app, cb).open() 或带 plugin */
+  constructor(app, onChoose, plugin) {
+    this.app = app;
+    this.onChoose = onChoose;
+    this.plugin = plugin || null;
+  }
+  open() {
     const map = new Map();
-    map.set("", { path: "", name: "(整个仓库)" });
+    map.set("", "(整个仓库)");
     for (const f of this.app.vault.getMarkdownFiles()) {
       let folder = f.parent;
       while (folder) {
         if (folder.path && !folder.path.startsWith(".obsidian") && !folder.path.startsWith(".trash")) {
-          if (!map.has(folder.path)) map.set(folder.path, folder);
+          if (!map.has(folder.path)) map.set(folder.path, folder.path);
         }
         folder = folder.parent;
       }
     }
-    return Array.from(map.values()).sort((a, b) => (a.path || "").localeCompare(b.path || ""));
-  }
-  getItemText(item) {
-    return item.path ? item.path : "(整个仓库)";
-  }
-  onChooseItem(item) {
-    if (this.onChooseCb) this.onChooseCb(item.path || "");
+    const items = Array.from(map.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([path, text]) => ({ value: path, text: text || "(整个仓库)" }));
+    new PathPickModal(this.app, this.plugin, {
+      title: "📁 选择要推送的文件夹",
+      hint: "点选后开始推送；可用「返回推送控制台」回去。",
+      items,
+      onChoose: this.onChoose,
+    }).open();
   }
 }
 
-class StartFromSuggestModal extends FuzzySuggestModal {
-  constructor(app, paths, onChoose) {
-    super(app);
+class StartFromSuggestModal {
+  constructor(app, paths, onChoose, plugin) {
+    this.app = app;
     this.paths = paths || [];
-    this.onChooseCb = onChoose;
-    this.setPlaceholder("选择从哪一篇开始推送…");
+    this.onChoose = onChoose;
+    this.plugin = plugin || null;
   }
-  getItems() { return this.paths; }
-  getItemText(path) { return path; }
-  onChooseItem(path) {
-    if (this.onChooseCb) this.onChooseCb(path);
+  open() {
+    const items = (this.paths || []).map(p => ({ value: p, text: p }));
+    new PathPickModal(this.app, this.plugin, {
+      title: "⏭ 从指定位置重新推送",
+      hint: "选择从哪一篇开始；可用「返回推送控制台」回去。",
+      items,
+      onChoose: this.onChoose,
+    }).open();
   }
 }
 
@@ -857,6 +1508,7 @@ class VaultTreeSelectModal extends Modal {
 
     const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
     acts.style.marginTop = "12px";
+    addBackToControlButton(acts, this, this.plugin);
     const go = acts.createEl("button", { text: "开始推送勾选项", cls: "mod-cta" });
     go.onclick = () => {
       const paths = Array.from(this.selected).sort((a, b) => a.localeCompare(b));
@@ -870,8 +1522,7 @@ class VaultTreeSelectModal extends Modal {
         label: `勾选推送（${paths.length} 篇）`,
       });
     };
-    const close = acts.createEl("button", { text: "取消" });
-    close.style.marginLeft = "8px";
+    const close = acts.createEl("button", { text: "关闭" });
     close.onclick = () => this.close();
   }
 
@@ -973,11 +1624,18 @@ class PushControlModal extends Modal {
     this.modalEl.addClass("si-push-control-modal");
     this.plugin._controlModal = this;
     this.render();
+    // 定时拉最新进度（任务在后台跑时，关掉再开也能跟上）
     this._timer = window.setInterval(() => {
       try { this.refreshProgress(); } catch (e) { /* ignore */ }
     }, 400);
+    // 若状态是 running 但循环意外停了，自动续跑（绝不因关控制台而暂停）
+    const job = this.plugin.settings.pushJob;
+    if (job && job.status === "running" && !this.plugin._jobLoopRunning) {
+      this.plugin.runPushJobLoop().catch(e => console.warn("[SiPush] 续跑失败:", e));
+    }
   }
   onClose() {
+    // 只关 UI，不暂停、不取消后台推送
     if (this._timer) {
       window.clearInterval(this._timer);
       this._timer = null;
@@ -999,6 +1657,7 @@ class PushControlModal extends Modal {
   fillStatus(box) {
     box.empty();
     const job = this.plugin.settings.pushJob;
+    const looping = !!this.plugin._jobLoopRunning;
     if (!job || job.status === "idle" || job.status === "done") {
       box.createEl("p", { text: "当前没有进行中的推送任务" });
     } else {
@@ -1007,7 +1666,8 @@ class PushControlModal extends Modal {
       const shown = Math.min(cur, total);
       const pct = Math.min(100, Math.round((shown / total) * 100));
       const phaseText = job.phase === "wikilinks" ? "写入双链" : "上传文档";
-      const statusText = job.status === "paused" ? "已暂停 ⏸" : (job.status === "running" ? "进行中 ▶️" : job.status);
+      let statusText = job.status === "paused" ? "已暂停 ⏸" : (job.status === "running" ? "进行中 ▶️" : job.status);
+      if (job.status === "running" && looping) statusText = "后台推送中 ▶️";
       box.createEl("p", { text: `状态：${statusText} · ${job.label || ""}` });
       box.createEl("p", { text: `进度：${phaseText} ${shown}/${total}（${pct}%）` });
 
@@ -1025,6 +1685,12 @@ class PushControlModal extends Modal {
         text: `本轮 ✅${(job.results && job.results.synced) || 0}  ❌${(job.results && job.results.failed) || 0}` +
           ((job.results && job.results.assets) ? `  🖼️${job.results.assets}` : ""),
       });
+      if (job.status === "running") {
+        box.createEl("p", {
+          cls: "si-push-doc-preview",
+          text: "提示：关闭控制台不会暂停，任务在后台继续；再打开即可看最新进度。",
+        });
+      }
     }
     const failN = (this.plugin.settings.failedQueue || []).length;
     if (failN > 0) {
@@ -1065,7 +1731,7 @@ class PushControlModal extends Modal {
       this.close();
       new FolderSuggestModal(this.app, (folderPath) => {
         this.plugin.pushFolder(folderPath);
-      }).open();
+      }, this.plugin).open();
     };
     mkBtn(startActs, "当前文件夹").onclick = () => {
       if (!this.plugin.ensureConfigured()) return;
@@ -1100,7 +1766,7 @@ class PushControlModal extends Modal {
         || this.plugin.listPushableFiles().map(f => f.path);
       if (!paths.length) { new Notice("没有可选择的笔记"); return; }
       this.close();
-      new StartFromSuggestModal(this.app, paths, (path) => this.plugin.restartPushFrom(path)).open();
+      new StartFromSuggestModal(this.app, paths, (path) => this.plugin.restartPushFrom(path), this.plugin).open();
     };
     mkBtn(ctrl, "取消任务").onclick = async () => { await this.plugin.cancelPushJob(); this.refreshProgress(); };
 
@@ -1113,6 +1779,7 @@ class PushControlModal extends Modal {
     };
     if (failN > 0) {
       mkBtn(more, "🔁 重试失败项").onclick = () => {
+        // 控制台保持打开，直接开跑并刷新进度
         this.plugin.retryFailedQueue();
       };
     }
@@ -1124,10 +1791,20 @@ class PushControlModal extends Modal {
     mkBtn(more, "迁移 ID 到文末").onclick = () => {
       this.plugin.migrateAllPushIdsToFooter({ force: true });
     };
+    mkBtn(more, "🧹 去重思源资源池", "mod-cta").onclick = () => {
+      if (!this.plugin.ensureConfigured()) return;
+      this.close();
+      this.plugin.openAssetDedup();
+    };
+    mkBtn(more, "🔊 修复音视频引用").onclick = () => {
+      if (!this.plugin.ensureConfigured()) return;
+      this.plugin.repairSiYuanAudioVideoMarkup();
+    };
     mkBtn(more, "测试思源连接").onclick = () => this.plugin.testConnection();
 
-    const close = contentEl.createEl("button", { text: "关闭" });
+    const close = contentEl.createEl("button", { text: "关闭（后台继续推送）" });
     close.style.cssText = "display:block;margin:16px auto 0";
+    close.title = "仅关闭窗口，不会暂停正在进行的推送";
     close.onclick = () => this.close();
   }
 }
@@ -1136,14 +1813,21 @@ class PushControlModal extends Modal {
 // 搜索拉回弹窗
 // ═══════════════════════════════════════════════════════════════════
 class SearchPullModal extends Modal {
-  constructor(app, api, nb) { super(app); this.api = api; this.nb = nb; this.result = null; this._resolve = null; }
+  constructor(app, api, nb, plugin) {
+    super(app);
+    this.api = api;
+    this.nb = nb;
+    this.plugin = plugin || null;
+    this.result = null;
+    this._resolve = null;
+  }
   onOpen() {
     this.modalEl.addClass("si-push-wide-modal");
     const { contentEl } = this;
     contentEl.addClass("si-push-search-modal");
     contentEl.createEl("h2", { text: "🔍 搜索思源文档并拉回 Obsidian" });
     const inp = contentEl.createEl("input", { type: "text", placeholder: "关键词搜索（留空列全部已关联）" });
-    Object.assign(inp.style, { width:"100%", margin:"8px 0", padding:"8px" });
+    Object.assign(inp.style, { width: "100%", margin: "8px 0", padding: "8px" });
     const box = contentEl.createDiv();
     const btn = contentEl.createEl("button", { text: "🔍 搜索", cls: "mod-cta" });
     btn.onclick = async () => {
@@ -1157,12 +1841,22 @@ class SearchPullModal extends Modal {
         for (const b of data) {
           const li = list.createEl("li", { cls: "si-push-doc-item" });
           li.createEl("div", { text: b.hpath || "(无路径)", cls: "si-push-doc-path" });
-          li.createEl("div", { text: (b.content||"").substring(0,60), cls: "si-push-doc-preview" });
+          li.createEl("div", { text: (b.content || "").substring(0, 60), cls: "si-push-doc-preview" });
           li.onclick = () => { this.result = b; this.close(); };
         }
-      } catch(e) { box.empty(); box.createEl("div", { text: "失败: " + e.message, cls: "si-push-error" }); }
+      } catch (e) {
+        box.empty();
+        box.createEl("div", { text: "失败: " + e.message, cls: "si-push-error" });
+      }
     };
     inp.addEventListener("keydown", e => { if (e.key === "Enter") btn.click(); });
+
+    const acts = contentEl.createDiv({ cls: "si-push-conflict-actions" });
+    acts.style.marginTop = "12px";
+    if (this.plugin) addBackToControlButton(acts, this, this.plugin);
+    const close = acts.createEl("button", { text: "关闭" });
+    close.onclick = () => this.close();
+
     inp.focus();
   }
   onClose() { this.contentEl.empty(); if (this._resolve) this._resolve(this.result); }
@@ -1173,12 +1867,27 @@ class SearchPullModal extends Modal {
 // 主插件
 // ═══════════════════════════════════════════════════════════════════
 /** 思源默认不允许超过 7 层文档；超深路径压平，避免 createDocWithMd 失败 */
-/** 思源在第 7 层文档下不能再建子文档；默认按 6 层压平更稳妥 */
+/** 叶子文档可以落在第 7 层；不能在第 7 层文档下再创建子文档 */
 const SIYUAN_MAX_DOC_DEPTH = 7;
-const SIYUAN_SAFE_DOC_DEPTH = 6;
+const SIYUAN_SAFE_DOC_DEPTH = 7;
+
+function normalizeHPath(p) {
+  let s = String(p == null ? "" : p).trim().replace(/\\/g, "/");
+  if (!s) return "";
+  if (!s.startsWith("/")) s = "/" + s;
+  s = s.replace(/\/+/g, "/").replace(/\/$/, "");
+  return s || "/";
+}
 
 function buildPath(defaultPath, fileOrTitle, preserveFolder, maxDepth) {
-  const prefix = (defaultPath || "/Obsidian/").replace(/\/+$/, "");
+  // defaultPath 为空或 "/" 时，文档建在笔记本根下（不再强制 /Obsidian）
+  let prefix = String(defaultPath == null ? "/Obsidian/" : defaultPath).trim();
+  if (prefix === "" || prefix === "/") {
+    prefix = "";
+  } else {
+    prefix = prefix.replace(/\/+$/, "");
+    if (!prefix.startsWith("/")) prefix = "/" + prefix;
+  }
   const prefixParts = prefix.split("/").filter(Boolean);
   const rawLimit = Number(maxDepth) || SIYUAN_SAFE_DOC_DEPTH;
   const limit = Math.max(1, Math.min(rawLimit, SIYUAN_MAX_DOC_DEPTH));
@@ -1190,18 +1899,18 @@ function buildPath(defaultPath, fileOrTitle, preserveFolder, maxDepth) {
       // 总深度 = 前缀层数 + Obsidian 相对路径层数，必须 ≤ limit
       const maxParts = Math.max(1, limit - prefixParts.length);
       if (parts.length > maxParts) {
-        // 保留靠前的目录，把多出来的路径段合并进最后一层文档名
+        // 保留靠前的目录，把多出来的中间路径并进最后一层文档名（用 __ 连接）
         const keep = Math.max(0, maxParts - 1);
         const head = parts.slice(0, keep);
         const leaf = safeTitle(parts.slice(keep).join("__"));
         parts = head.concat(leaf);
-        console.log("[SiPush] 路径超深已压平:", fileOrTitle.path, "→", prefix + "/" + parts.join("/"));
+        console.log("[SiPush] 路径超深已压平:", fileOrTitle.path, "→", (prefix || "") + "/" + parts.join("/"));
       }
-      return prefix + "/" + parts.join("/");
+      return (prefix || "") + "/" + parts.join("/");
     }
-    return prefix + "/" + safeTitle(fileOrTitle.basename);
+    return (prefix || "") + "/" + safeTitle(fileOrTitle.basename);
   }
-  return prefix + "/" + safeTitle(String(fileOrTitle || "untitled"));
+  return (prefix || "") + "/" + safeTitle(String(fileOrTitle || "untitled"));
 }
 
 function pluginBuildPath(plugin, fileOrTitle) {
@@ -1251,7 +1960,7 @@ class SiPushPlugin extends Plugin {
     this.addCommand({ id: "push-tree-select", name: "树状勾选文档推送到思源", icon: "list-tree",
       callback: () => this.openVaultTreeSelect() });
     this.addCommand({ id: "push-folder", name: "选择文件夹推送到思源", icon: "folder",
-      callback: () => new FolderSuggestModal(this.app, (p) => this.pushFolder(p)).open() });
+      callback: () => new FolderSuggestModal(this.app, (p) => this.pushFolder(p), this).open() });
     this.addCommand({ id: "push-current-folder", name: "推送当前笔记所在文件夹到思源", icon: "folder",
       callback: () => this.pushCurrentFolder() });
     this.addCommand({ id: "push-current-only", name: "仅推送当前笔记到思源（含资源双链）", icon: "file",
@@ -1278,8 +1987,13 @@ class SiPushPlugin extends Plugin {
       callback: () => this.testConnection() });
     this.addCommand({ id: "migrate-push-id-footer", name: "迁移关联 ID 到文末（清除 frontmatter）", icon: "arrow-down",
       callback: () => this.migrateAllPushIdsToFooter({ force: true }) });
+    this.addCommand({ id: "dedup-siyuan-assets", name: "去重思源资源池（按内容哈希）", icon: "trash",
+      callback: () => this.openAssetDedup() });
+    this.addCommand({ id: "repair-siyuan-av-markup", name: "修复思源音视频引用（![]→播放器）", icon: "audio-file",
+      callback: () => this.repairSiYuanAudioVideoMarkup() });
 
     this.addSettingTab(new SiPushSettingTab(this.app, this));
+    this.loadAssetIndex().catch(e => console.warn("[SiPush] loadAssetIndex:", e));
     this.migrateFailedQueueFromHistory();
     // 上次异常退出时若任务停在 running，改为 paused，方便继续
     if (this.settings.pushJob && this.settings.pushJob.status === "running") {
@@ -1309,6 +2023,9 @@ class SiPushPlugin extends Plugin {
     this.settings.syncHistory = Array.isArray(saved.syncHistory) ? saved.syncHistory.slice() : [];
     this.settings.failedQueue = Array.isArray(saved.failedQueue) ? saved.failedQueue.slice() : [];
     this.settings.notebookCache = Array.isArray(saved.notebookCache) ? saved.notebookCache.slice() : [];
+    this.settings.assetMap = (saved.assetMap && typeof saved.assetMap === "object")
+      ? Object.assign({}, saved.assetMap)
+      : {};
     if (saved.pushJob && typeof saved.pushJob === "object") {
       this.settings.pushJob = Object.assign({}, saved.pushJob);
       if (Array.isArray(saved.pushJob.paths)) this.settings.pushJob.paths = saved.pushJob.paths.slice();
@@ -1320,6 +2037,15 @@ class SiPushPlugin extends Plugin {
       }
     } else {
       this.settings.pushJob = null;
+    }
+    // 旧默认最大深度 6 会把深层目录压成 a__b__c，自动升到思源允许的 7
+    if (saved.maxDocDepthMigratedTo7 !== true) {
+      const d = Number(saved.maxDocDepth);
+      if (!Number.isFinite(d) || d === 6) {
+        this.settings.maxDocDepth = 7;
+      }
+      this.settings.maxDocDepthMigratedTo7 = true;
+      await this.saveSettings();
     }
     // 旧默认 /assets/sipush/ 在思源中常导致附件引用找不到，自动迁移
     const fixedAssetsDir = resolveAssetsDirPath(this.settings.assetsDirPath);
@@ -1384,12 +2110,23 @@ class SiPushPlugin extends Plugin {
     new PushHistoryModal(this.app, this).open();
   }
 
-  openPushControl() {
+  openPushControl(opts) {
+    opts = opts || {};
     if (this._controlModal) {
-      try { this._controlModal.refreshProgress(); } catch (e) { /* ignore */ }
-      return;
+      try {
+        // 已打开时也拉最新进度；需要整页刷新时 forceRender
+        if (opts.forceRender && typeof this._controlModal.render === "function") {
+          this._controlModal.render();
+        } else if (typeof this._controlModal.refreshProgress === "function") {
+          this._controlModal.refreshProgress();
+        }
+      } catch (e) { /* ignore */ }
+      return this._controlModal;
     }
-    new PushControlModal(this.app, this).open();
+    // 重新打开：新建弹窗，onOpen 会读当前 pushJob 最新进度
+    const modal = new PushControlModal(this.app, this);
+    modal.open();
+    return modal;
   }
 
   /** 从历史同步报告里捞失败项进队列（升级兼容） */
@@ -1463,9 +2200,9 @@ class SiPushPlugin extends Plugin {
 
   async appendToExisting(content) {
     if (!this.settings.defaultNotebookId) { new Notice("请先配置默认笔记本"); return; }
-    const m = new SearchPullModal(this.app, this.api, this.settings.defaultNotebookId);
+    const m = new SearchPullModal(this.app, this.api, this.settings.defaultNotebookId, this);
     const doc = await m.openAndGetResult();
-    if (!doc) { new Notice("已取消"); return; }
+    if (!doc) return;
     let md = content; if (!this.settings.pushFrontmatter) md = stripFM(md);
     new Notice("正在追加...");
     try { await this.api.appendToDoc(doc.id, md.trim()); new Notice("✅ 追加成功！"); }
@@ -1555,7 +2292,7 @@ class SiPushPlugin extends Plugin {
       ? job.paths
       : this.listPushableFiles("").map(f => f.path);
     if (!paths.length) { new Notice("没有可选择的笔记"); return; }
-    new StartFromSuggestModal(this.app, paths, (path) => this.restartPushFrom(path)).open();
+    new StartFromSuggestModal(this.app, paths, (path) => this.restartPushFrom(path), this).open();
   }
 
   async startPushJob({ paths, label, startPath }) {
@@ -1566,6 +2303,7 @@ class SiPushPlugin extends Plugin {
       // 正在跑：登记为暂停后重启，避免直接开新任务失败
       this._pendingRestart = { paths, label, startPath };
       this._pauseRequested = true;
+      this.openPushControl({ forceRender: true });
       new Notice("当前推送将先暂停，然后从新任务重新开始…");
       return;
     }
@@ -1591,10 +2329,12 @@ class SiPushPlugin extends Plugin {
     this._pauseRequested = false;
     this._pendingRestart = null;
     await this.saveSettings();
+    // 先打开/刷新控制台，再跑任务，保证进度条能实时看见
+    this.openPushControl({ forceRender: true });
     this.refreshStatusBar();
-    // 打开/聚焦控制台，便于实时跟进进度
-    this.openPushControl();
     new Notice(`开始${label || "推送"}：共 ${paths.length} 篇` + (startPath ? `（从 ${startPath} 起）` : ""), 5000);
+    // 让弹窗完成首帧渲染后再进入长循环
+    await new Promise(r => window.setTimeout(r, 80));
     await this.runPushJobLoop();
   }
 
@@ -1624,8 +2364,9 @@ class SiPushPlugin extends Plugin {
     this._pauseRequested = false;
     await this.saveSettings();
     this.refreshStatusBar();
-    this.openPushControl();
+    this.openPushControl({ forceRender: true });
     new Notice(`继续推送：${job.phase === "wikilinks" ? "双链" : "上传"} ${job.phase === "wikilinks" ? job.wikiCursor : job.cursor}/${job.paths.length}`);
+    await new Promise(r => window.setTimeout(r, 50));
     await this.runPushJobLoop();
   }
 
@@ -1660,6 +2401,8 @@ class SiPushPlugin extends Plugin {
     this.isSyncing = true;
     if (!this._assetCache) this._assetCache = new Map();
     if (!this._siDocMap) this._siDocMap = { byPath: new Map(), byName: new Map() };
+    if (!this._docIdByPushId) this._docIdByPushId = new Map();
+    if (!this._pushIdByPath) this._pushIdByPath = new Map();
 
     // 从「双链阶段」恢复时，必须先重建文档 ID 映射
     if (job.phase === "wikilinks" && this.settings.rewriteWikilinks !== false) {
@@ -1683,7 +2426,7 @@ class SiPushPlugin extends Plugin {
 
         const filePath = job.paths[job.cursor];
         const file = this.app.vault.getAbstractFileByPath(filePath);
-        this.setStatusBarText(`上传 ${job.cursor + 1}/${job.paths.length}`);
+        this.refreshStatusBar();
 
         try {
           if (!(file instanceof TFile)) throw new Error("文件不存在");
@@ -1692,6 +2435,16 @@ class SiPushPlugin extends Plugin {
           if (!this.settings.pushFrontmatter) md = stripFM(md);
           const prepared = await this.prepareMarkdownForPush(file, md, { skipWikilinks: true });
           job.results.assets += prepared.assetCount || 0;
+          if (prepared.assetErrors && prepared.assetErrors.length) {
+            for (const ae of prepared.assetErrors) {
+              job.results.details.push({
+                title: file.path,
+                status: "error",
+                direction: "附件失败",
+                detail: ((ae.path || "") + ": " + (ae.error || "")).substring(0, 160),
+              });
+            }
+          }
           const siPath = pluginBuildPath(this, file);
           const docId = await this.pushToSiYuan(file, siPath, prepared.md, pushId, file.basename, { quiet: true, prepared: true });
           if (docId) this.registerSiDoc(file, docId);
@@ -1699,7 +2452,8 @@ class SiPushPlugin extends Plugin {
           job.results.details.push({
             title: file.path,
             status: "success",
-            direction: "已推送" + (prepared.assetCount ? ` (资源 ${prepared.assetCount})` : ""),
+            direction: "已推送" + (prepared.assetCount ? ` (资源 ${prepared.assetCount})` : "") +
+              ((prepared.assetErrors && prepared.assetErrors.length) ? ` ⚠附件失败${prepared.assetErrors.length}` : ""),
           });
         } catch (e) {
           job.results.failed++;
@@ -1713,6 +2467,7 @@ class SiPushPlugin extends Plugin {
 
         job.cursor++;
         job.updatedAt = utcSec();
+        this.refreshStatusBar();
         if (job.cursor % 5 === 0 || job.cursor >= job.paths.length) {
           // 精简 details，避免内存/磁盘膨胀：成功只保留最近 30 条，失败全留
           const fails = job.results.details.filter(d => d.status === "error");
@@ -1756,7 +2511,7 @@ class SiPushPlugin extends Plugin {
 
         const filePath = job.paths[job.wikiCursor];
         const file = this.app.vault.getAbstractFileByPath(filePath);
-        this.setStatusBarText(`双链 ${job.wikiCursor + 1}/${job.paths.length}`);
+        this.refreshStatusBar();
         try {
           if (file instanceof TFile) {
             let md = await this.app.vault.read(file);
@@ -1775,6 +2530,7 @@ class SiPushPlugin extends Plugin {
           console.warn("[SiPush] 双链回写失败:", filePath, e.message);
         }
         job.wikiCursor++;
+        this.refreshStatusBar();
         if (job.wikiCursor % 10 === 0) await this.saveSettings();
       }
 
@@ -1786,6 +2542,7 @@ class SiPushPlugin extends Plugin {
         job.phase = "done";
         job.status = "done";
         job.updatedAt = utcSec();
+        await this.flushAssetMapIfNeeded(true);
         await this.saveSettings();
         await this.logSyncHistory(job.results);
         this.refreshStatusBar();
@@ -1795,6 +2552,8 @@ class SiPushPlugin extends Plugin {
     } finally {
       this._jobLoopRunning = false;
       this.isSyncing = false;
+      // 暂停时也落盘 assetMap，避免恢复后重复上传产生多份附件
+      await this.flushAssetMapIfNeeded(true);
       if (!this.settings.pushJob || this.settings.pushJob.status !== "running") {
         this._assetCache = null;
         if (this.settings.pushJob && this.settings.pushJob.status === "done") this._siDocMap = null;
@@ -1820,16 +2579,18 @@ class SiPushPlugin extends Plugin {
     // 推送到思源时去掉文末 ID 标记，避免污染思源正文
     let out = stripPushIdFooter(md || "");
     let assetCount = 0;
+    let assetErrors = [];
     if (this.settings.syncAssets !== false) {
       const r = await this.rewriteAndUploadAssets(sourceFile, out);
       out = r.md;
-      assetCount = r.count;
+      assetCount = r.count || 0;
+      assetErrors = r.errors || [];
     }
     // 第一遍建文档时可跳过双链；第二遍再用文档 ID 写成 ((id "锚文本"))
     if (!opts.skipWikilinks && this.settings.rewriteWikilinks !== false) {
       out = this.rewriteWikilinks(sourceFile, out);
     }
-    return { md: out, assetCount };
+    return { md: out, assetCount, assetErrors };
   }
 
   /** 注册 Obsidian 文件 ↔ 思源文档 ID，供双链改写 */
@@ -1921,87 +2682,336 @@ class SiPushPlugin extends Plugin {
       const guessed = guessVaultNameFromAssetLink(cleaned);
       if (guessed) tryPaths.push(guessed);
     }
+    const sourcePath = (sourceFile && sourceFile.path) || "";
     for (const p of tryPaths) {
-      const resolved = this.app.metadataCache.getFirstLinkpathDest(p, sourceFile.path);
+      const resolved = this.app.metadataCache.getFirstLinkpathDest(p, sourcePath);
       if (resolved instanceof TFile) return resolved;
       const byPath = this.app.vault.getAbstractFileByPath(p);
       if (byPath instanceof TFile) return byPath;
     }
+    // 仅文件名 / 语雀 UUID 文件名：全库按 basename 兜底（优先 assets/）
+    const base = cleaned.split("/").pop();
+    if (base && base !== cleaned) {
+      const resolved = this.app.metadataCache.getFirstLinkpathDest(base, sourcePath);
+      if (resolved instanceof TFile) return resolved;
+    }
+    if (base) {
+      const hits = this.app.vault.getFiles().filter(f => f.name === base);
+      if (hits.length === 1) return hits[0];
+      if (hits.length > 1) {
+        const inAssets = hits.find(f => /(^|\/)assets\//i.test(f.path));
+        if (inAssets) return inAssets;
+        // 同目录优先
+        const dir = sourcePath.includes("/") ? sourcePath.slice(0, sourcePath.lastIndexOf("/") + 1) : "";
+        const sameDir = dir ? hits.find(f => f.path.startsWith(dir)) : null;
+        if (sameDir) return sameDir;
+        return hits[0];
+      }
+    }
     return null;
+  }
+
+  fileAssetMeta(file) {
+    const size = (file.stat && typeof file.stat.size === "number")
+      ? file.stat.size
+      : ((file.stat && file.stat.size) || 0);
+    return { mtime: file.mtime || 0, size: size || 0 };
+  }
+
+  /** 独立 JSON：记录 vault 路径 / 内容哈希 → 思源 assets 路径 */
+  assetIndexFilePath() {
+    const dir = (this.manifest && this.manifest.dir)
+      || path.join(this.app.vault.adapter.basePath, ".obsidian", "plugins", "obsidian-si-push-main");
+    return path.join(dir, "asset-index.json");
+  }
+
+  emptyAssetIndex() {
+    return { version: 1, updatedAt: 0, byHash: {}, byVaultPath: {} };
+  }
+
+  async loadAssetIndex() {
+    if (this._assetIndex) return this._assetIndex;
+    const filePath = this.assetIndexFilePath();
+    let idx = this.emptyAssetIndex();
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          idx = Object.assign(this.emptyAssetIndex(), parsed);
+          idx.byHash = parsed.byHash && typeof parsed.byHash === "object" ? parsed.byHash : {};
+          idx.byVaultPath = parsed.byVaultPath && typeof parsed.byVaultPath === "object" ? parsed.byVaultPath : {};
+        }
+      }
+    } catch (e) {
+      console.warn("[SiPush] 读取 asset-index.json 失败:", e.message);
+    }
+    // 从旧 settings.assetMap 迁移一次
+    const legacy = this.settings.assetMap || {};
+    const legacyKeys = Object.keys(legacy);
+    if (legacyKeys.length && Object.keys(idx.byVaultPath).length === 0) {
+      for (const vaultPath of legacyKeys) {
+        const hit = legacy[vaultPath];
+        if (!hit || !hit.path) continue;
+        idx.byVaultPath[vaultPath] = {
+          siPath: normalizeAssetLinkPath(hit.path),
+          hash: hit.hash || null,
+          mtime: hit.mtime || 0,
+          size: hit.size || 0,
+          firstSeenAt: hit.firstSeenAt || Date.now(),
+        };
+      }
+      this._assetIndex = idx;
+      await this.saveAssetIndex(true);
+      console.log("[SiPush] 已从 settings.assetMap 迁移到 asset-index.json:", legacyKeys.length);
+    }
+    this._assetIndex = idx;
+    return idx;
+  }
+
+  async saveAssetIndex(force) {
+    if (!this._assetIndex) return;
+    if (!force && !this._assetIndexDirty) return;
+    this._assetIndex.updatedAt = Date.now();
+    const filePath = this.assetIndexFilePath();
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify(this._assetIndex, null, 2), "utf8");
+      this._assetIndexDirty = false;
+    } catch (e) {
+      console.warn("[SiPush] 保存 asset-index.json 失败:", e.message);
+    }
+  }
+
+  lookupIndexByVaultPath(file) {
+    const idx = this._assetIndex || this.emptyAssetIndex();
+    const hit = idx.byVaultPath[file.path];
+    if (!hit || !hit.siPath) return null;
+    const meta = this.fileAssetMeta(file);
+    if (hit.mtime && meta.mtime && hit.mtime !== meta.mtime) return null;
+    if (hit.size && meta.size && hit.size !== meta.size) return null;
+    return normalizeAssetLinkPath(hit.siPath);
+  }
+
+  lookupIndexByHash(hash) {
+    if (!hash) return null;
+    const idx = this._assetIndex || this.emptyAssetIndex();
+    const hit = idx.byHash[hash];
+    if (!hit || !hit.siPath) return null;
+    return {
+      siPath: normalizeAssetLinkPath(hit.siPath),
+      firstSeenAt: hit.firstSeenAt || 0,
+      size: hit.size || 0,
+    };
+  }
+
+  rememberAssetIndex(file, assetPath, hash, meta) {
+    if (!file || !assetPath) return;
+    if (!this._assetIndex) this._assetIndex = this.emptyAssetIndex();
+    const siPath = normalizeAssetLinkPath(assetPath);
+    const m = meta || this.fileAssetMeta(file);
+    const now = Date.now();
+    const prevHash = hash ? this._assetIndex.byHash[hash] : null;
+    // 同哈希保留最早那份思源路径
+    if (hash) {
+      if (!prevHash || !prevHash.siPath) {
+        this._assetIndex.byHash[hash] = {
+          siPath,
+          size: m.size || 0,
+          firstSeenAt: now,
+          vaultPaths: [file.path],
+        };
+      } else {
+        const paths = Array.isArray(prevHash.vaultPaths) ? prevHash.vaultPaths.slice() : [];
+        if (!paths.includes(file.path)) paths.push(file.path);
+        // 不覆盖更早的 siPath
+        this._assetIndex.byHash[hash] = {
+          siPath: prevHash.siPath || siPath,
+          size: prevHash.size || m.size || 0,
+          firstSeenAt: prevHash.firstSeenAt || now,
+          vaultPaths: paths,
+        };
+      }
+    }
+    this._assetIndex.byVaultPath[file.path] = {
+      siPath: (hash && this._assetIndex.byHash[hash] && this._assetIndex.byHash[hash].siPath) || siPath,
+      hash: hash || null,
+      mtime: m.mtime || 0,
+      size: m.size || 0,
+      firstSeenAt: (prevHash && prevHash.firstSeenAt) || now,
+    };
+    this._assetIndexDirty = true;
+  }
+
+  /** 兼容旧调用名 */
+  async flushAssetMapIfNeeded(force) {
+    await this.saveAssetIndex(!!force);
   }
 
   async uploadVaultFile(file) {
     if (!this._assetCache) this._assetCache = new Map();
     if (this._assetCache.has(file.path)) return this._assetCache.get(file.path);
-    const data = await this.app.vault.readBinary(file);
-    // 带上 MIME，避免部分环境下音视频被当成无名二进制后无法播放
-    const mime = guessAssetMime(file.extension);
-    const blob = mime ? new Blob([data], { type: mime }) : new Blob([data]);
-    const uploadName = uniqueAssetName(file);
+
+    await this.loadAssetIndex();
+
+    // 1) 路径级缓存（mtime/size 未变）
+    const byPath = this.lookupIndexByVaultPath(file);
+    if (byPath) {
+      this._assetCache.set(file.path, byPath);
+      return byPath;
+    }
+
+    const meta = this.fileAssetMeta(file);
+    const sizeMb = meta.size ? (meta.size / (1024 * 1024)) : 0;
+    if (sizeMb >= 40) {
+      console.log("[SiPush] 大附件上传中:", file.path, sizeMb.toFixed(1) + "MB");
+    }
+
+    let data;
+    try {
+      data = await this.app.vault.readBinary(file);
+    } catch (e) {
+      throw new Error("读取附件失败: " + file.path + " — " + e.message);
+    }
+    if (!data || (meta.size > 1024 && data.byteLength < 100)) {
+      throw new Error("附件内容异常（可能是损坏的占位文件）: " + file.path);
+    }
+
+    // 2) 内容哈希：同内容直接复用最早那份，不再上传
+    const hash = await sha256Hex(data);
+    const byHash = this.lookupIndexByHash(hash);
+    if (byHash && byHash.siPath) {
+      // 可选：确认思源侧还在（失败则继续上传）
+      let stillThere = true;
+      try {
+        const st = await this.api.statAsset(byHash.siPath);
+        if (!st || !(st.size > 0)) stillThere = false;
+      } catch (e) {
+        stillThere = false;
+      }
+      if (stillThere) {
+        this._assetCache.set(file.path, byHash.siPath);
+        this.rememberAssetIndex(file, byHash.siPath, hash, meta);
+        await this.saveAssetIndex(false);
+        return byHash.siPath;
+      }
+    }
+
+    const mime = guessAssetMime(file.extension) || "application/octet-stream";
+    const uploadName = uniqueAssetName(file, hash);
+    let body;
+    try {
+      body = new File([data], uploadName, { type: mime });
+    } catch (e) {
+      body = new Blob([data], { type: mime });
+    }
     const assetsDir = resolveAssetsDirPath(this.settings.assetsDirPath);
-    const assetPath = await this.api.uploadAsset(blob, uploadName, assetsDir);
+    let assetPath = null;
+    try {
+      assetPath = await this.api.uploadAsset(body, uploadName, assetsDir);
+    } catch (e) {
+      if (sizeMb >= 15) {
+        console.warn("[SiPush] 大附件上传失败，重试一次:", file.path, e.message);
+        await new Promise(r => setTimeout(r, 1000));
+        assetPath = await this.api.uploadAsset(body, uploadName, assetsDir);
+      } else {
+        throw e;
+      }
+    }
     if (!assetPath) throw new Error("资源上传无返回路径: " + file.path);
+
+    // 写入哈希索引：同内容只保留一份路径（若旧文件已不存在则更新为本次上传）
+    if (hash) {
+      const prev = this._assetIndex.byHash[hash];
+      if (!prev || !prev.siPath) {
+        this._assetIndex.byHash[hash] = {
+          siPath: assetPath,
+          size: meta.size || 0,
+          firstSeenAt: Date.now(),
+          vaultPaths: [file.path],
+        };
+      } else {
+        // 旧映射对应文件已不存在时，换成新上传路径
+        prev.siPath = assetPath;
+        const paths = Array.isArray(prev.vaultPaths) ? prev.vaultPaths : [];
+        if (!paths.includes(file.path)) paths.push(file.path);
+        prev.vaultPaths = paths;
+        prev.size = prev.size || meta.size || 0;
+      }
+      this._assetIndexDirty = true;
+    }
+    this.rememberAssetIndex(file, assetPath, hash, meta);
     this._assetCache.set(file.path, assetPath);
+    await this.saveAssetIndex(false);
     return assetPath;
   }
 
   async rewriteAndUploadAssets(sourceFile, md) {
     let count = 0;
     let out = md;
+    const errors = [];
+    const seenReplace = new Set();
+
+    const replaceOne = async (fullMatch, file, alias) => {
+      if (seenReplace.has(fullMatch)) return;
+      try {
+        const before = this._assetCache && this._assetCache.has(file.path);
+        await this.loadAssetIndex();
+        const indexed = !before && !!this.lookupIndexByVaultPath(file);
+        const assetPath = await this.uploadVaultFile(file);
+        // 仅统计真正新上传；缓存/索引命中不算新资源
+        if (!before && !indexed) count++;
+        out = out.split(fullMatch).join(formatAssetMarkdown(file, assetPath, alias));
+        seenReplace.add(fullMatch);
+      } catch (e) {
+        const msg = (e && e.message) || String(e);
+        console.warn("[SiPush] 资源上传失败:", file.path, msg);
+        errors.push({ path: file.path, error: msg });
+        seenReplace.add(fullMatch);
+      }
+    };
 
     // 1) ![[任意附件]] — 嵌入：图片 / PDF / 音频 / 视频 / 文档 全部上传
     const embedRe = /!\[\[([^\]]+)\]\]/g;
     const embeds = [...out.matchAll(embedRe)];
     for (const m of embeds) {
-      const raw = m[1];
-      const { path: linkPath, alias } = parseWikiTarget(raw);
+      const { path: linkPath, alias } = parseWikiTarget(m[1]);
       const file = this.resolveVaultFile(sourceFile, linkPath);
       if (!file || !isAssetFile(file)) continue;
-      try {
-        const assetPath = await this.uploadVaultFile(file);
-        count++;
-        out = out.split(m[0]).join(formatAssetMarkdown(file, assetPath, alias));
-      } catch (e) {
-        console.warn("[SiPush] 嵌入资源上传失败:", file.path, e.message);
-      }
+      await replaceOne(m[0], file, alias);
     }
 
-    // 2) [[附件.ext]] — 无 ! 的资源双链（非 md）也必须上传，否则思源打不开
+    // 2) [[附件.ext]] — 无 ! 的资源双链（非 md）也必须上传
     const wikiAssetRe = /(?<!!)\[\[([^\]]+)\]\]/g;
     const wikiAssets = [...out.matchAll(wikiAssetRe)];
     for (const m of wikiAssets) {
-      const raw = m[1];
-      const { path: linkPath, alias } = parseWikiTarget(raw);
-      // 看起来像带扩展名的附件，或能解析到非 md 文件
+      const { path: linkPath, alias } = parseWikiTarget(m[1]);
       const file = this.resolveVaultFile(sourceFile, linkPath);
       if (!file || !isAssetFile(file)) continue;
-      try {
-        const assetPath = await this.uploadVaultFile(file);
-        count++;
-        out = out.split(m[0]).join(formatAssetMarkdown(file, assetPath, alias));
-      } catch (e) {
-        console.warn("[SiPush] 附件双链上传失败:", file.path, e.message);
-      }
+      await replaceOne(m[0], file, alias);
     }
 
-    // 3) ![alt](本地路径) — Markdown 内联媒体
+    // 3) ![alt](本地路径 / 已有 assets) — 图片保留；音视频若仍是 ![]() 则改成 <audio>/<video>
     const mdImgRe = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
     const imgs = [...out.matchAll(mdImgRe)];
     for (const m of imgs) {
       const alt = m[1] || "";
       const link = decodeUriPath(m[2].replace(/^<|>$/g, ""));
-      if (isRemoteUrl(link) || shouldReuseAssetLink(link)) continue;
+      if (isRemoteUrl(link)) continue;
+      if (shouldReuseAssetLink(link)) {
+        const ext = extFromAssetPath(link);
+        if (isAudioExt(ext) || isVideoExt(ext)) {
+          out = out.split(m[0]).join(formatAssetMarkdown(null, link, alt || null));
+          seenReplace.add(m[0]);
+        }
+        continue;
+      }
       const file = this.resolveVaultFile(sourceFile, link);
       if (!file || !isAssetFile(file)) continue;
-      try {
-        const assetPath = await this.uploadVaultFile(file);
-        count++;
-        out = out.split(m[0]).join(formatAssetMarkdown(file, assetPath, alt || null));
-      } catch (e) {
-        console.warn("[SiPush] Markdown 资源上传失败:", file.path, e.message);
-      }
+      await replaceOne(m[0], file, alt || null);
     }
 
+    // 3b) 已有错误写法残留：正文里直接是 assets/xxx.mp3 的图片语法已在上面处理
     // 4) [text](本地附件) — 普通 Markdown 附件链接（非 md）
     const mdLinkRe = /(?<!!)\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
     const links = [...out.matchAll(mdLinkRe)];
@@ -2012,16 +3022,10 @@ class SiPushPlugin extends Plugin {
       if (/\.md$/i.test(link)) continue;
       const file = this.resolveVaultFile(sourceFile, link);
       if (!file || !isAssetFile(file)) continue;
-      try {
-        const assetPath = await this.uploadVaultFile(file);
-        count++;
-        out = out.split(m[0]).join(formatAssetMarkdown(file, assetPath, text || null));
-      } catch (e) {
-        console.warn("[SiPush] 附件上传失败:", file.path, e.message);
-      }
+      await replaceOne(m[0], file, text || null);
     }
 
-    return { md: out, count };
+    return { md: out, count, errors };
   }
 
   // ── V2: 单笔记双向同步 ──
@@ -2180,7 +3184,7 @@ class SiPushPlugin extends Plugin {
 
     // 2. 查找思源文档
     let siDoc;
-    try { siDoc = await this.api.findDoc(pushId); }
+    try { siDoc = await this.resolveExistingSiDoc(pushId, pluginBuildPath(this, file)); }
     catch(e) { console.error("[SiPush] findDoc error:", e.message); return "error"; }
 
     if (!siDoc) {
@@ -2291,9 +3295,9 @@ class SiPushPlugin extends Plugin {
   // ── V2: 搜索拉回 ──
   async pullFromSiYuan() {
     if (!this.settings.defaultNotebookId) { new Notice("请先配置默认笔记本"); return; }
-    const m = new SearchPullModal(this.app, this.api, this.settings.defaultNotebookId);
+    const m = new SearchPullModal(this.app, this.api, this.settings.defaultNotebookId, this);
     const doc = await m.openAndGetResult();
-    if (!doc) { new Notice("已取消"); return; }
+    if (!doc) return;
     try {
       const md = await this.api.getDocMd(doc.id);
       if (!md) { new Notice("文档无内容"); return; }
@@ -2307,15 +3311,43 @@ class SiPushPlugin extends Plugin {
     } catch(e) { new Notice("❌ 拉回失败: " + e.message, 6000); }
   }
 
-  // ── 获取或生成 pushId：写在文末极小字，一次写盘清掉顶部 frontmatter ──
+  // ── 获取或生成 pushId：写在文末极小字；会话内缓存，避免二次生成新 ID ──
   async getOrCreatePushId(file) {
+    if (!this._pushIdByPath) this._pushIdByPath = new Map();
+    if (file && file.path && this._pushIdByPath.has(file.path)) {
+      return this._pushIdByPath.get(file.path);
+    }
     let content = "";
     try { content = await this.app.vault.read(file); } catch (e) { content = ""; }
     const { id, md, changed } = applyPushIdFooterMigration(content, { createIfMissing: true });
     if (changed) {
       await this.app.vault.modify(file, md);
     }
+    if (file && file.path && id) this._pushIdByPath.set(file.path, id);
     return id;
+  }
+
+  /** 解析已有思源文档：内存缓存 → pushId 属性 → hpath，杜绝重复 create */
+  async resolveExistingSiDoc(pushId, path) {
+    if (!this._docIdByPushId) this._docIdByPushId = new Map();
+    if (pushId && this._docIdByPushId.has(pushId)) {
+      return { id: this._docIdByPushId.get(pushId), hpath: path || null };
+    }
+    let doc = null;
+    if (pushId) {
+      try { doc = await this.api.findDoc(pushId); } catch (e) { /* ignore */ }
+    }
+    if (!doc && path && this.settings.defaultNotebookId) {
+      try { doc = await this.api.findDocByHPath(this.settings.defaultNotebookId, path); } catch (e) { /* ignore */ }
+    }
+    if (doc && doc.id && pushId) this._docIdByPushId.set(pushId, doc.id);
+    return doc;
+  }
+
+  rememberSiDoc(pushId, docId, file) {
+    if (!this._docIdByPushId) this._docIdByPushId = new Map();
+    if (pushId && docId) this._docIdByPushId.set(pushId, docId);
+    if (file) this.registerSiDoc(file, docId);
   }
 
   /** 全库：把 custom-si-push-id 从顶部挪到文末小字（不推思源） */
@@ -2376,34 +3408,633 @@ class SiPushPlugin extends Plugin {
     }
     const hash = contentHash(finalMd.replace(/^# .*\n*/, "").trim());
     const mtime = file ? Math.floor(file.mtime / 1000) : utcSec();
-    let existingDoc = null;
-    try { existingDoc = await this.api.findDoc(pushId); } catch(e) {}
 
-    if (existingDoc) {
+    // 先找已有文档（缓存 / 关联 ID / 同路径），避免 createDocWithMd 再造「标题1」
+    let existingDoc = await this.resolveExistingSiDoc(pushId, path);
+
+    if (existingDoc && existingDoc.id) {
       try {
-        await this.api.updateDoc(existingDoc.id, finalMd);
-        await this.api.setSyncInfo(existingDoc.id, hash, mtime);
-        await this.api.setAttrs(existingDoc.id, { "custom-si-push-id": pushId, title: title });
-        if (file) this.registerSiDoc(file, existingDoc.id);
+        const docId = await this.updateOrRealignSiDoc(
+          existingDoc, path, finalMd, pushId, title, hash, mtime
+        );
+        this.rememberSiDoc(pushId, docId, file);
         if (!opts.quiet) new Notice("📤 → 思源 ✅ 推送更新成功!");
-        return existingDoc.id;
-      } catch(e) {
+        return docId;
+      } catch (e) {
         if (!opts.quiet) new Notice("❌ 更新失败: " + e.message, 6000);
         throw e;
       }
-    } else {
+    }
+
+    try {
+      const res = await this.api.createDoc(this.settings.defaultNotebookId, path, finalMd);
+      let docId = typeof res === "string" ? res : (res && (res.id || res.rootID)) || res;
+      if (docId && typeof docId === "object") docId = docId.id || docId.rootID || null;
+      if (!docId) throw new Error("创建文档未返回 ID");
+
+      await this.api.setSyncInfo(docId, hash, mtime);
+      await this.api.setAttrs(docId, { "custom-si-push-id": pushId, title: title });
+      this.rememberSiDoc(pushId, docId, file);
+
+      // 核验：同 pushId 是否已有更早文档（属性延迟时误建的合并回去）
       try {
-        const res = await this.api.createDoc(this.settings.defaultNotebookId, path, finalMd);
-        const docId = typeof res === "string" ? res : (res && (res.id || res.rootID)) || res;
-        await this.api.setSyncInfo(docId, hash, mtime);
-        await this.api.setAttrs(docId, { "custom-si-push-id": pushId, title: title });
-        if (file) this.registerSiDoc(file, docId);
-        if (!opts.quiet) new Notice("📤 → 思源 ✅ 推送新建成功!");
-        return docId;
-      } catch(e) {
-        if (!opts.quiet) new Notice("❌ 推送失败: " + e.message, 6000);
-        throw e;
+        const again = await this.api.findDoc(pushId);
+        if (again && again.id && again.id !== docId) {
+          await this.api.updateDoc(again.id, finalMd);
+          await this.api.setSyncInfo(again.id, hash, mtime);
+          await this.api.setAttrs(again.id, { "custom-si-push-id": pushId, title: title });
+          this.rememberSiDoc(pushId, again.id, file);
+          console.warn("[SiPush] 检测到重复文档，已合并到已有文档:", again.id, "新建的是:", docId);
+          return again.id;
+        }
+      } catch (e) { /* ignore */ }
+
+      if (!opts.quiet) new Notice("📤 → 思源 ✅ 推送新建成功!");
+      return docId;
+    } catch (e) {
+      try {
+        const byPath = await this.api.findDocByHPath(this.settings.defaultNotebookId, path);
+        if (byPath && byPath.id) {
+          await this.api.updateDoc(byPath.id, finalMd);
+          await this.api.setSyncInfo(byPath.id, hash, mtime);
+          await this.api.setAttrs(byPath.id, { "custom-si-push-id": pushId, title: title });
+          this.rememberSiDoc(pushId, byPath.id, file);
+          if (!opts.quiet) new Notice("📤 → 思源 ✅ 推送更新成功!");
+          return byPath.id;
+        }
+      } catch (e2) { /* ignore */ }
+      if (!opts.quiet) new Notice("❌ 推送失败: " + e.message, 6000);
+      throw e;
+    }
+  }
+
+  /** 更新已有文档；路径不一致时按设置迁到正确层级 */
+  async updateOrRealignSiDoc(existingDoc, path, finalMd, pushId, title, hash, mtime) {
+    const notebookId = this.settings.defaultNotebookId;
+    let currentPath = existingDoc.hpath || null;
+    if (!currentPath) {
+      try { currentPath = await this.api.getHPathByID(existingDoc.id); } catch (e) { /* ignore */ }
+    }
+    const cur = normalizeHPath(currentPath);
+    const want = normalizeHPath(path);
+    const shouldRealign =
+      this.settings.realignDocPath !== false &&
+      want && want !== "/" &&
+      cur && cur !== want;
+
+    if (!shouldRealign) {
+      await this.api.updateDoc(existingDoc.id, finalMd);
+      await this.api.setSyncInfo(existingDoc.id, hash, mtime);
+      await this.api.setAttrs(existingDoc.id, { "custom-si-push-id": pushId, title: title });
+      return existingDoc.id;
+    }
+
+    console.log("[SiPush] 校正文档路径:", cur, "→", want);
+
+    // 目标路径已有文档：更新它，并删掉旧位置上的同关联文档
+    const atTarget = await this.api.findDocByHPath(notebookId, path);
+    if (atTarget && atTarget.id) {
+      await this.api.updateDoc(atTarget.id, finalMd);
+      await this.api.setSyncInfo(atTarget.id, hash, mtime);
+      await this.api.setAttrs(atTarget.id, { "custom-si-push-id": pushId, title: title });
+      if (atTarget.id !== existingDoc.id) {
+        try { await this.api.removeDocByID(existingDoc.id); } catch (e) {
+          console.warn("[SiPush] 删除旧路径文档失败:", e.message);
+        }
       }
+      return atTarget.id;
+    }
+
+    // 在正确路径新建，再删旧文档
+    try {
+      const res = await this.api.createDoc(notebookId, path, finalMd);
+      let docId = typeof res === "string" ? res : (res && (res.id || res.rootID)) || res;
+      if (docId && typeof docId === "object") docId = docId.id || docId.rootID || null;
+      if (!docId) throw new Error("校正路径时创建文档未返回 ID");
+      await this.api.setSyncInfo(docId, hash, mtime);
+      await this.api.setAttrs(docId, { "custom-si-push-id": pushId, title: title });
+      try { await this.api.removeDocByID(existingDoc.id); } catch (e) {
+        console.warn("[SiPush] 删除旧路径文档失败:", e.message);
+      }
+      return docId;
+    } catch (e) {
+      console.warn("[SiPush] 路径校正失败，回退原地更新:", e.message);
+      await this.api.updateDoc(existingDoc.id, finalMd);
+      await this.api.setSyncInfo(existingDoc.id, hash, mtime);
+      await this.api.setAttrs(existingDoc.id, { "custom-si-push-id": pushId, title: title });
+      return existingDoc.id;
+    }
+  }
+
+  // ── 思源资源池去重（不重推笔记） ──
+  openAssetDedup() {
+    if (!this.ensureConfigured()) return;
+    if (this._assetDedupModal) {
+      try { this._assetDedupModal.render(); } catch (e) { /* ignore */ }
+      return this._assetDedupModal;
+    }
+    const modal = new AssetDedupModal(this.app, this);
+    this._assetDedupModal = modal;
+    modal.open();
+    return modal;
+  }
+
+  /** 递归列出 data/assets 下全部文件 */
+  async listSiYuanAssetFiles(onProgress) {
+    const api = this.api;
+    const out = [];
+    const report = (msg, detail) => {
+      if (!onProgress) return;
+      onProgress({
+        message: msg,
+        current: out.length,
+        total: 0,
+        detail: detail || "",
+        stats: out.length ? `已枚举 ${out.length} 个文件` : "",
+      });
+    };
+    const walk = async (relDir) => {
+      // relDir: "data/assets" 或 "data/assets/sub"
+      const entries = await api.readDir(relDir);
+      for (const ent of entries) {
+        if (!ent || !ent.name || ent.name.startsWith(".")) continue;
+        const child = relDir.replace(/\/+$/, "") + "/" + ent.name;
+        if (ent.isDir) {
+          if (out.length % 50 === 0) report("① 枚举 data/assets…", "目录 " + child);
+          await walk(child);
+          continue;
+        }
+        // 跳过注解 / OCR 等旁路文件
+        if (/\.sya$/i.test(ent.name) || ent.name === "ocr-texts.json") continue;
+        const size = typeof ent.size === "number" ? ent.size : 0;
+        const updated = ent.updated || ent.modTime || 0;
+        // data/assets/xxx → assets/xxx
+        const linkPath = child.replace(/^data\//, "");
+        out.push({
+          name: ent.name,
+          workspacePath: child,
+          linkPath: normalizeAssetLinkPath(linkPath),
+          size,
+          updated,
+        });
+        if (out.length === 1 || out.length % 80 === 0) {
+          report(`① 枚举资源… 已发现 ${out.length}`, ent.name);
+          await yieldUi();
+        }
+      }
+    };
+    await walk("data/assets");
+    report(`① 枚举完成：共 ${out.length} 个资源`, "");
+    return out;
+  }
+
+  /** 从文档块中收集被引用的 assets 文件名（只扫引用，不读附件正文） */
+  async collectReferencedAssetNames(onProgress) {
+    onProgress && onProgress({
+      message: "⑤ 扫描文档中的附件引用…",
+      current: 0,
+      total: 0,
+      detail: "",
+      stats: "",
+    });
+    const names = new Set();
+    const paths = new Set();
+    let offset = 0;
+    const page = 3000;
+    // 分页拉取含 assets/ 的块，避免一次过大
+    for (let round = 0; round < 20; round++) {
+      const rows = await this.api.request("/api/query/sql", {
+        stmt:
+          "SELECT markdown FROM blocks WHERE markdown LIKE '%assets/%' " +
+          "LIMIT " + page + " OFFSET " + offset,
+      });
+      const list = Array.isArray(rows) ? rows : [];
+      if (!list.length) break;
+      const re = /assets\/([^\s)\]\"'<>]+)/gi;
+      for (const r of list) {
+        const md = r && r.markdown ? String(r.markdown) : "";
+        let m;
+        re.lastIndex = 0;
+        while ((m = re.exec(md))) {
+          let full = decodeUriPath(m[0].split("?")[0]);
+          full = normalizeAssetLinkPath(full);
+          paths.add(full);
+          const base = full.split("/").pop();
+          if (base) names.add(base);
+        }
+      }
+      offset += list.length;
+      onProgress && onProgress({
+        message: `⑤ 解析引用块…`,
+        current: round + 1,
+        total: 0,
+        detail: `已扫块 ${offset} · 引用资源名 ${names.size}`,
+        stats: `分页 ${round + 1}`,
+      });
+      await yieldUi();
+      if (list.length < page) break;
+    }
+    return { names, paths };
+  }
+
+  /**
+   * 快速去重扫描：
+   * 1) 枚举文件名（很快）
+   * 2) 文件名族归组，只留 ≥2 的候选
+   * 3) 只对候选 stat 大小
+   * 4) 同族同大小 → 视为重复（默认不读全文哈希）
+   * 5) 查文档引用：只有被引用的副本才需要 findReplace
+   */
+  async scanSiYuanAssetDuplicates(opts) {
+    opts = opts || {};
+    const rawProgress = opts.onProgress || (() => {});
+    const onProgress = (info) => {
+      if (typeof info === "string") rawProgress({ message: info });
+      else rawProgress(info || {});
+    };
+    const strictHash = !!opts.strictHash;
+
+    onProgress({ message: "① 枚举 data/assets 文件名…", current: 0, total: 0, detail: "", stats: "" });
+    const files = await this.listSiYuanAssetFiles(onProgress);
+    onProgress({
+      message: `共 ${files.length} 个文件，② 按文件名族归组…`,
+      current: files.length,
+      total: files.length || 1,
+      detail: "",
+      stats: "",
+    });
+
+    const byFamily = new Map();
+    for (const f of files) {
+      const key = assetFamilyKey(f.name);
+      f.familyKey = key;
+      if (!byFamily.has(key)) byFamily.set(key, []);
+      byFamily.get(key).push(f);
+    }
+
+    const familyCandidates = [];
+    let familyCount = 0;
+    for (const [, list] of byFamily) {
+      if (list.length < 2) continue;
+      familyCount++;
+      familyCandidates.push(...list);
+    }
+    onProgress({
+      message: `③ 疑似重复族 ${familyCount}（${familyCandidates.length} 个文件），读取大小…`,
+      current: 0,
+      total: Math.max(1, familyCandidates.length),
+      detail: "",
+      stats: `族 ${familyCount}`,
+    });
+
+    let stated = 0;
+    for (const f of familyCandidates) {
+      stated++;
+      if (stated % 10 === 0 || stated === familyCandidates.length || stated === 1) {
+        onProgress({
+          message: `③ 读取大小 ${stated}/${familyCandidates.length}`,
+          current: stated,
+          total: familyCandidates.length,
+          detail: f.name,
+          stats: `疑似族 ${familyCount}`,
+        });
+        await yieldUi();
+      }
+      try {
+        const st = await this.api.statAsset(f.linkPath);
+        f.size = Number(st.size) || 0;
+        if (st.created) f.created = Number(st.created) || 0;
+        if (st.updated) f.updated = Number(st.updated) || f.updated;
+      } catch (e) {
+        f.size = 0;
+      }
+    }
+
+    // 同族 + 同大小
+    const sizeGroups = new Map();
+    for (const f of familyCandidates) {
+      if (!f.size) continue;
+      const gk = f.familyKey + "|" + f.size;
+      if (!sizeGroups.has(gk)) sizeGroups.set(gk, []);
+      sizeGroups.get(gk).push(f);
+    }
+
+    let dupLists = [];
+    for (const [, list] of sizeGroups) {
+      if (list.length >= 2) dupLists.push(list);
+    }
+
+    // 严格模式才全文哈希
+    if (strictHash) {
+      const flat = dupLists.flat();
+      onProgress({
+        message: `④ 严格模式：对 ${flat.length} 个候选算哈希…`,
+        current: 0,
+        total: Math.max(1, flat.length),
+        detail: "",
+        stats: "",
+      });
+      const byHash = new Map();
+      let hashed = 0;
+      for (const f of flat) {
+        hashed++;
+        if (hashed % 2 === 0 || hashed === flat.length || hashed === 1) {
+          onProgress({
+            message: `④ 哈希 ${hashed}/${flat.length}`,
+            current: hashed,
+            total: flat.length,
+            detail: `${f.name}（${formatBytes(f.size)}）`,
+            stats: "",
+          });
+          await yieldUi();
+        }
+        try {
+          const buf = await this.api.getFileBinary(f.workspacePath);
+          if (buf && buf.byteLength) f.size = buf.byteLength;
+          f.hash = await sha256Hex(buf);
+          if (!byHash.has(f.hash)) byHash.set(f.hash, []);
+          byHash.get(f.hash).push(f);
+        } catch (e) {
+          f.hashError = e.message;
+        }
+      }
+      dupLists = [];
+      for (const [, list] of byHash) {
+        if (list.length >= 2) dupLists.push(list);
+      }
+    } else {
+      onProgress({
+        message: "④ 快速模式：跳过全文哈希（同族同大小直接合并）",
+        current: dupLists.length,
+        total: Math.max(1, dupLists.length),
+        detail: "",
+        stats: `重复组候选 ${dupLists.length}`,
+      });
+      for (const list of dupLists) {
+        for (const f of list) f.hash = "family|" + f.familyKey + "|" + f.size;
+      }
+    }
+
+    // ⑤ 引用扫描：只对将要删除的副本查是否被引用
+    const ref = await this.collectReferencedAssetNames(onProgress);
+    onProgress({
+      message: `⑤ 文档引用资源 ${ref.names.size} 个，标记需改链接的副本…`,
+      current: 0,
+      total: Math.max(1, dupLists.length),
+      detail: "",
+      stats: "",
+    });
+
+    const groups = [];
+    let duplicateCount = 0;
+    let bytesSaved = 0;
+    let referencedDupCount = 0;
+
+    for (let gi = 0; gi < dupLists.length; gi++) {
+      const list = dupLists[gi];
+      const sorted = list.slice().sort((a, b) => {
+        const ta = (a.created && a.created > 0) ? a.created : assetEarlinessMs(a);
+        const tb = (b.created && b.created > 0) ? b.created : assetEarlinessMs(b);
+        if (ta !== tb) return ta - tb;
+        return String(a.linkPath).localeCompare(String(b.linkPath));
+      });
+      const keep = sorted[0];
+      const remove = sorted.slice(1).map(f => {
+        const referenced =
+          ref.paths.has(f.linkPath) ||
+          ref.names.has(f.name) ||
+          ref.paths.has(normalizeAssetLinkPath(f.linkPath));
+        if (referenced) referencedDupCount++;
+        return Object.assign({}, f, { referenced: !!referenced });
+      });
+      duplicateCount += remove.length;
+      bytesSaved += remove.reduce((s, x) => s + (x.size || 0), 0);
+      groups.push({
+        hash: keep.hash || ("family|" + keep.familyKey + "|" + keep.size),
+        size: keep.size || 0,
+        keep,
+        remove,
+        files: sorted,
+      });
+      if ((gi + 1) % 20 === 0 || gi === dupLists.length - 1) {
+        onProgress({
+          message: `⑤ 整理重复组 ${gi + 1}/${dupLists.length}`,
+          current: gi + 1,
+          total: dupLists.length,
+          detail: keep.name,
+          stats: `可删 ${duplicateCount} · 需改引用 ${referencedDupCount}`,
+        });
+      }
+    }
+    groups.sort((a, b) => (b.size * b.remove.length) - (a.size * a.remove.length));
+
+    return {
+      totalFiles: files.length,
+      candidateCount: familyCandidates.length,
+      groups,
+      duplicateCount,
+      referencedDupCount,
+      bytesSaved,
+      mode: strictHash ? "strict" : "fast",
+      scannedAt: utcSec(),
+    };
+  }
+
+  /** 只删除重复组里的多余副本：每份都先尝试改引用，再删文件；从不按「未引用」清孤儿 */
+  async applySiYuanAssetDedup(plan, opts) {
+    opts = opts || {};
+    const rawProgress = opts.onProgress || (() => {});
+    const onProgress = (info) => {
+      if (typeof info === "string") rawProgress({ message: info });
+      else rawProgress(info || {});
+    };
+    const groups = (plan && plan.groups) || [];
+    const totalDups = groups.reduce((n, g) => n + ((g.remove && g.remove.length) || 0), 0);
+    let replaced = 0;
+    let deleted = 0;
+    let failed = 0;
+    let done = 0;
+    const replacements = [];
+
+    onProgress({
+      message: `开始执行：仅删重复副本 · ${groups.length} 组 · ${totalDups} 个`,
+      current: 0,
+      total: Math.max(1, totalDups),
+      detail: "不会删除非重复文件",
+      stats: "",
+    });
+
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      const keep = g.keep;
+      // 安全：必须有保留文件，且只处理 remove 列表里的重复副本
+      if (!keep || !keep.linkPath || !Array.isArray(g.remove) || !g.remove.length) continue;
+      for (const dup of g.remove) {
+        done++;
+        // 绝不删「保留项」本身
+        if (!dup || !dup.linkPath || normalizeAssetLinkPath(dup.linkPath) === normalizeAssetLinkPath(keep.linkPath)) {
+          onProgress({
+            message: `跳过 ${done}/${totalDups}`,
+            current: done,
+            total: Math.max(1, totalDups),
+            detail: "与保留文件相同，跳过",
+            stats: `已删 ${deleted} · 改引用 ${replaced} · 失败 ${failed}`,
+          });
+          await yieldUi();
+          continue;
+        }
+        onProgress({
+          message: `删除重复副本 ${done}/${totalDups}（组 ${i + 1}/${groups.length}）`,
+          current: done,
+          total: Math.max(1, totalDups),
+          detail: `先改引用再删：${dup.name} → 保留 ${keep.name}`,
+          stats: `已删 ${deleted} · 改引用 ${replaced} · 失败 ${failed}`,
+        });
+        await yieldUi();
+        try {
+          // 不论扫描是否标「已引用」，都先尝试全局改链，避免漏扫导致断链
+          try {
+            await this.api.findReplaceAssetPath(dup.linkPath, keep.linkPath);
+            replaced++;
+            replacements.push({ from: dup.linkPath, to: keep.linkPath });
+          } catch (e) {
+            console.warn("[SiPush] 改引用失败(继续删副本):", dup.linkPath, e.message);
+          }
+          try {
+            await this.api.findReplaceAssetPath("data/" + dup.linkPath, "data/" + keep.linkPath);
+          } catch (e) { /* ignore */ }
+
+          try {
+            await this.api.removeFile(dup.workspacePath);
+            deleted++;
+          } catch (e1) {
+            try {
+              await this.api.removeUnusedAsset(dup.linkPath);
+              deleted++;
+            } catch (e2) {
+              failed++;
+              console.warn("[SiPush] 删除重复副本失败:", dup.linkPath, e1.message, e2.message);
+            }
+          }
+        } catch (e) {
+          failed++;
+          console.warn("[SiPush] 去重失败:", dup.linkPath, "→", keep.linkPath, e.message);
+        }
+      }
+    }
+
+    onProgress({
+      message: "更新本地附件索引映射…",
+      current: totalDups,
+      total: Math.max(1, totalDups),
+      detail: "",
+      stats: `已删重复副本 ${deleted} · 改引用 ${replaced}`,
+    });
+
+    await this.loadAssetIndex();
+    let mapFixed = 0;
+    const fromSet = new Map(replacements.map(r => [normalizeAssetLinkPath(r.from), normalizeAssetLinkPath(r.to)]));
+    for (const key of Object.keys(this._assetIndex.byVaultPath || {})) {
+      const entry = this._assetIndex.byVaultPath[key];
+      if (!entry || !entry.siPath) continue;
+      const cur = normalizeAssetLinkPath(entry.siPath);
+      if (fromSet.has(cur)) {
+        entry.siPath = fromSet.get(cur);
+        mapFixed++;
+        this._assetIndexDirty = true;
+      }
+    }
+    for (const key of Object.keys(this._assetIndex.byHash || {})) {
+      const entry = this._assetIndex.byHash[key];
+      if (!entry || !entry.siPath) continue;
+      const cur = normalizeAssetLinkPath(entry.siPath);
+      if (fromSet.has(cur)) {
+        entry.siPath = fromSet.get(cur);
+        mapFixed++;
+        this._assetIndexDirty = true;
+      }
+    }
+    await this.saveAssetIndex(true);
+    onProgress({
+      message: `完成：仅删除重复副本 ${deleted} · 改引用 ${replaced} · 失败 ${failed}`,
+      current: totalDups,
+      total: Math.max(1, totalDups),
+      detail: mapFixed ? `本地索引已修正 ${mapFixed} 条` : "非重复文件均未触碰",
+      stats: "",
+    });
+    return { replaced, deleted, failed, skippedReplace: 0, mapFixed };
+  }
+
+  // ── 修复思源里被写成图片语法的音视频（显示「找不到」） ──
+  async repairSiYuanAudioVideoMarkup() {
+    if (!this.ensureConfigured()) return;
+    if (this._repairingAv) { new Notice("修复进行中…"); return; }
+    this._repairingAv = true;
+    const modal = new AssetOpProgressModal(this.app, this, "🔊 修复思源音视频引用");
+    modal.open();
+    modal.setProgress({ message: "正在查询含音视频图片语法的文档…", current: 0, total: 0 });
+    const avRe = /!\[([^\]]*)\]\((assets\/[^)\s]+\.(?:mp3|wav|flac|ogg|m4a|aac|wma|opus|mp4|webm|mov|mkv|avi|m4v|flv|wmv))\)/gi;
+    let scanned = 0;
+    let fixed = 0;
+    let failed = 0;
+    try {
+      const rows = await this.api.request("/api/query/sql", {
+        stmt:
+          "SELECT DISTINCT root_id FROM blocks WHERE type='p' AND (" +
+          "markdown LIKE '%](assets/%.mp3)%' OR markdown LIKE '%](assets/%.wav)%' OR " +
+          "markdown LIKE '%](assets/%.m4a)%' OR markdown LIKE '%](assets/%.mp4)%' OR " +
+          "markdown LIKE '%](assets/%.ogg)%' OR markdown LIKE '%](assets/%.flac)%'" +
+          ") LIMIT 5000",
+      });
+      const roots = Array.isArray(rows) ? rows.map(r => r.root_id).filter(Boolean) : [];
+      const uniq = Array.from(new Set(roots));
+      modal.setProgress({
+        message: uniq.length ? `找到 ${uniq.length} 篇候选文档，开始修复…` : "未找到需修复的文档",
+        current: 0,
+        total: Math.max(1, uniq.length),
+        detail: "",
+        stats: "",
+      });
+      for (const id of uniq) {
+        scanned++;
+        modal.setProgress({
+          message: `修复音视频 ${scanned}/${uniq.length}`,
+          current: scanned,
+          total: uniq.length,
+          detail: `文档 ${id}`,
+          stats: `已修复 ${fixed} · 失败 ${failed}`,
+        });
+        await yieldUi();
+        try {
+          const md = await this.api.getDocMd(id);
+          if (!md || !avRe.test(md)) continue;
+          avRe.lastIndex = 0;
+          const next = md.replace(avRe, (_, alt, p) => formatAssetMarkdown(null, p, alt || null));
+          if (next === md) continue;
+          await this.api.updateDoc(id, next);
+          fixed++;
+        } catch (e) {
+          failed++;
+          console.warn("[SiPush] 修复音视频失败:", id, e.message);
+        }
+      }
+      this.refreshStatusBar();
+      const doneMsg = `✅ 完成：扫描 ${scanned} · 修复 ${fixed} · 失败 ${failed}`;
+      modal.setProgress({
+        message: doneMsg,
+        current: uniq.length,
+        total: Math.max(1, uniq.length),
+        detail: "",
+        stats: "",
+      });
+      modal.markDone(doneMsg);
+      new Notice(doneMsg, 8000);
+    } catch (e) {
+      modal.markDone("❌ 修复失败: " + e.message);
+      new Notice("❌ 修复失败: " + e.message, 8000);
+    } finally {
+      this._repairingAv = false;
+      this.refreshStatusBar();
     }
   }
 
@@ -2520,69 +4151,41 @@ class SiPushPlugin extends Plugin {
   }
 
   async retryFailedQueue() {
-    if (this.isSyncing) { new Notice("同步进行中..."); return; }
     if (!this.ensureConfigured()) return;
-    const queue = [...(this.settings.failedQueue || [])];
-    if (!queue.length) { new Notice("失败队列为空，无需重试"); return; }
+    const queue = this.settings.failedQueue || [];
+    if (!queue.length) {
+      new Notice("失败队列为空，无需重试");
+      return;
+    }
 
-    this.isSyncing = true;
-    this._assetCache = new Map();
-    this._siDocMap = { byPath: new Map(), byName: new Map() };
-    this.setStatusBarText("重试失败项…");
-    new Notice(`正在重试 ${queue.length} 篇失败笔记…`, 4000);
-
-    const results = { synced: 0, failed: 0, conflicts: 0, deleted: 0, skipped: 0, assets: 0, details: [] };
-
-    for (let i = 0; i < queue.length; i++) {
-      const item = queue[i];
+    const paths = [];
+    let missing = 0;
+    for (const item of queue) {
       const file = this.app.vault.getAbstractFileByPath(item.path);
-      try {
-        this.setStatusBarText(`重试 ${i + 1}/${queue.length}`);
-        if (!(file instanceof TFile)) {
-          results.failed++;
-          results.details.push({ title: item.path, status: "error", direction: "异常", detail: "文件已不存在" });
-          continue;
-        }
-        const pushId = await this.getOrCreatePushId(file);
-        let md = await this.app.vault.read(file);
-        if (!this.settings.pushFrontmatter) md = stripFM(md);
-        const prepared = await this.prepareMarkdownForPush(file, md, { skipWikilinks: true });
-        results.assets += prepared.assetCount || 0;
-        const path = pluginBuildPath(this, file);
-        const docId = await this.pushToSiYuan(file, path, prepared.md, pushId, file.basename, { quiet: true, prepared: true });
-        if (docId) this.registerSiDoc(file, docId);
-        results.synced++;
-        results.details.push({ title: file.path, status: "success", direction: "重试成功" });
-      } catch (e) {
-        results.failed++;
-        results.details.push({
-          title: item.path,
-          status: "error",
-          direction: "异常",
-          detail: (e.message || String(e)).substring(0, 120),
-        });
-        // 增加重试计数
-        const q = this.settings.failedQueue || [];
-        const hit = q.find(x => x.path === item.path);
-        if (hit) hit.retries = (hit.retries || 0) + 1;
+      if (file instanceof TFile) {
+        paths.push(item.path);
+        item.retries = (item.retries || 0) + 1;
+      } else {
+        missing++;
       }
     }
+    await this.saveSettings();
 
-    // 重试成功后再补双链
-    const okFiles = results.details
-      .filter(d => d.status === "success")
-      .map(d => this.app.vault.getAbstractFileByPath(d.title))
-      .filter(f => f instanceof TFile);
-    if (okFiles.length && this.settings.rewriteWikilinks !== false) {
-      await this.rewriteVaultWikilinks(okFiles);
+    if (!paths.length) {
+      new Notice("失败队列里的文件都已不存在，无法重试");
+      return;
+    }
+    if (missing > 0) {
+      new Notice(`已跳过 ${missing} 个不存在的文件，开始重试 ${paths.length} 篇`, 5000);
     }
 
-    this.isSyncing = false;
-    this._assetCache = null;
-    this._siDocMap = null;
-    await this.logSyncHistory(results);
-    this.refreshStatusBar();
-    new SyncReportModal(this.app, results, this).open();
+    // 先打开控制台展示进度，再启动与普通推送相同的任务机
+    this.openPushControl({ forceRender: true });
+    await new Promise(r => window.setTimeout(r, 50));
+    await this.startPushJob({
+      paths,
+      label: `重试失败队列（${paths.length} 篇）`,
+    });
   }
 }
 
@@ -2627,7 +4230,7 @@ class SiPushSettingTab extends PluginSettingTab {
     if (this.plugin.settings.serverUrl) {
       this.refresh(true);
     }
-    new Setting(containerEl).setName("默认路径前缀").setDesc("思源中文档的存放路径")
+    new Setting(containerEl).setName("默认路径前缀").setDesc("思源文档根路径。填 /Obsidian/ 会建在「Obsidian」下；填 / 则直接在笔记本根下（与 Obsidian 文件夹一一对应，深层笔记更不容易被压平）")
       .addText(t => t.setPlaceholder("/Obsidian/").setValue(this.plugin.settings.defaultPath)
         .onChange(async v => { this.plugin.settings.defaultPath = v; await this.plugin.saveSettings(); }));
 
@@ -2659,18 +4262,23 @@ class SiPushSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl).setName("保留文件夹结构")
-      .setDesc("推送时尽量按 Obsidian 相对路径建文档；超过思源最大深度时自动压平")
+      .setDesc("推送时尽量按 Obsidian 相对路径建文档；超过思源最大深度时自动压平（中间层用 __ 拼进文档名）")
       .addToggle(t => t.setValue(this.plugin.settings.preserveFolderStructure !== false)
         .onChange(async v => { this.plugin.settings.preserveFolderStructure = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl).setName("思源文档最大深度")
-      .setDesc("建议 ≤6。思源在第 7 层下不能再建子文档；超深路径会自动压平")
-      .addText(t => t.setPlaceholder("6").setValue(String(this.plugin.settings.maxDocDepth || 6))
+      .setDesc("建议 7（思源叶子文档最深一层）。设小会把深层路径压成「目录__子目录__文件名」，看起来层级就乱了")
+      .addText(t => t.setPlaceholder("7").setValue(String(this.plugin.settings.maxDocDepth || 7))
         .onChange(async v => {
           const n = parseInt(v, 10);
-          this.plugin.settings.maxDocDepth = Number.isFinite(n) && n > 0 ? Math.min(n, 7) : 6;
+          this.plugin.settings.maxDocDepth = Number.isFinite(n) && n > 0 ? Math.min(n, 7) : 7;
           await this.plugin.saveSettings();
         }));
+
+    new Setting(containerEl).setName("自动校正文档路径")
+      .setDesc("已关联文档的思源路径与当前规则不一致时，推送会迁到正确层级并删除旧位置（改前缀/深度后重推可对齐层级）")
+      .addToggle(t => t.setValue(this.plugin.settings.realignDocPath !== false)
+        .onChange(async v => { this.plugin.settings.realignDocPath = v; await this.plugin.saveSettings(); }));
 
     const failN = (this.plugin.settings.failedQueue || []).length;
     containerEl.createEl("h3", { text: "📋 推送失败队列" });
@@ -2691,9 +4299,50 @@ class SiPushSettingTab extends PluginSettingTab {
       .setDesc("打开仓库文件夹树，勾选要同步到思源的文档")
       .addButton(b => b.setButtonText("打开树状选择").setCta().onClick(() => this.plugin.openVaultTreeSelect()));
     new Setting(containerEl).setName("同步媒体与附件")
-      .setDesc("图片、PDF、音视频、Office、压缩包(zip/rar/7z…)等本地引用一律上传到思源 assets")
+      .setDesc("图片、PDF、音视频(含 wav)、Office、压缩包等本地引用一律上传到思源 assets；已上传的会记住路径，避免重复上传出多份副本")
       .addToggle(t => t.setValue(this.plugin.settings.syncAssets !== false)
         .onChange(async v => { this.plugin.settings.syncAssets = v; await this.plugin.saveSettings(); }));
+
+    const idxPath = this.plugin.assetIndexFilePath();
+    let idxN = 0;
+    try {
+      const idx = this.plugin._assetIndex || null;
+      if (idx && idx.byHash) idxN = Object.keys(idx.byHash).length;
+      else if (fs.existsSync(idxPath)) {
+        const j = JSON.parse(fs.readFileSync(idxPath, "utf8"));
+        idxN = Object.keys((j && j.byHash) || {}).length;
+      }
+    } catch (e) { /* ignore */ }
+    new Setting(containerEl).setName("附件哈希索引")
+      .setDesc(idxN
+        ? `asset-index.json 已记录 ${idxN} 个内容哈希；同哈希附件推送时直接复用，不再重复上传`
+        : "同步时写入插件目录 asset-index.json（路径/哈希/思源 assets）")
+      .addButton(b => b.setButtonText("打开目录").onClick(() => {
+        try {
+          const { shell } = require("electron");
+          shell.showItemInFolder(idxPath);
+        } catch (e) {
+          new Notice("索引文件: " + idxPath, 8000);
+        }
+      }))
+      .addButton(b => b.setButtonText("清空索引").onClick(async () => {
+        this.plugin._assetIndex = this.plugin.emptyAssetIndex();
+        this.plugin._assetIndexDirty = true;
+        this.plugin._assetCache = null;
+        this.plugin.settings.assetMap = {};
+        await this.plugin.saveAssetIndex(true);
+        await this.plugin.saveSettings();
+        new Notice("已清空附件哈希索引");
+        this.display();
+      }));
+
+    new Setting(containerEl).setName("去重思源资源池")
+      .setDesc("只删重复副本（同内容/同族同大小多份里留最早一份）；不会因为「未被引用」而删除独立文件")
+      .addButton(b => b.setButtonText("开始去重").setCta().onClick(() => this.plugin.openAssetDedup()));
+
+    new Setting(containerEl).setName("修复音视频引用")
+      .setDesc("把思源里误写成 ![](assets/xxx.mp3) 的引用改成播放器（解决「找不到」）")
+      .addButton(b => b.setButtonText("立即修复").setCta().onClick(() => this.plugin.repairSiYuanAudioVideoMarkup()));
 
     new Setting(containerEl).setName("转换双链")
       .setDesc("将 [[笔记]] 转为思源块引用 ((文档ID \"显示名\"))，才能在思源里点击跳转")
