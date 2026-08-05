@@ -1,0 +1,293 @@
+/* ═══════════════════════════════════════════════════════════
+   SiPush - Obsidian 插件样式
+   V2 新增：冲突弹窗 / 同步报告
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── 统一加宽弹窗（控制台 / 报告 / 队列 / 搜索） ── */
+.modal.si-push-wide-modal,
+.modal.si-push-control-modal,
+.modal.si-push-conflict-modal,
+.modal.si-push-tree-modal {
+  width: min(880px, 94vw) !important;
+  max-width: 94vw !important;
+}
+.modal.si-push-control-modal {
+  width: min(920px, 96vw) !important;
+  max-width: 96vw !important;
+}
+.modal.si-push-tree-modal {
+  width: min(820px, 94vw) !important;
+}
+.modal.si-push-wide-modal .modal-content,
+.modal.si-push-control-modal .modal-content,
+.modal.si-push-conflict-modal .modal-content,
+.modal.si-push-tree-modal .modal-content {
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+/* ── 搜索弹窗 ── */
+.si-push-search-modal input[type="text"] {
+  border: 1px solid var(--background-modifier-border);
+}
+.si-push-search-results {
+  max-height: 300px;
+  overflow-y: auto;
+}
+.si-push-search-hint {
+  padding: 12px;
+  text-align: center;
+  color: var(--text-muted);
+}
+.si-push-error {
+  padding: 12px;
+  text-align: center;
+  color: var(--text-error);
+}
+
+/* ── 搜索结果列表 ── */
+.si-push-doc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.si-push-doc-item {
+  padding: 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.si-push-doc-item:hover {
+  background: var(--background-modifier-hover);
+}
+.si-push-doc-path {
+  font-weight: 500;
+  color: var(--text-normal);
+  font-size: 13px;
+}
+.si-push-doc-preview {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── V2: 冲突弹窗 ── */
+.si-push-conflict-modal h2 {
+  margin-top: 0;
+}
+.si-push-conflict-desc {
+  color: var(--text-muted);
+  margin-bottom: 16px;
+}
+.si-push-conflict-panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.si-push-conflict-pane {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 12px;
+}
+.si-push-conflict-pane h3 {
+  margin-top: 0;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+.si-push-conflict-pane pre {
+  font-size: 11px;
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+  color: var(--text-normal);
+}
+.si-push-conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-start;
+  align-items: center;
+  padding: 8px 0;
+}
+.si-push-conflict-actions button {
+  margin: 0 !important;
+  white-space: nowrap;
+}
+.si-push-control-modal h3 {
+  margin: 16px 0 6px;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+.si-push-control-status p {
+  margin: 4px 0;
+  line-height: 1.45;
+}
+.si-push-progress-bar {
+  width: 100%;
+  height: 10px;
+  margin: 10px 0 8px;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  overflow: hidden;
+}
+.si-push-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--interactive-accent);
+  transition: width 0.25s ease;
+}
+
+/* ── V2: 同步报告 ── */
+.si-push-search-modal ul.si-push-doc-list {
+  max-height: 280px;
+}
+.si-push-success { color: var(--text-accent); }
+.si-push-warning { color: #e0a800; }
+.si-push-error   { color: var(--text-error); }
+
+/* ── 信息框 ── */
+.si-push-info {
+  border-radius: 6px;
+}
+.si-push-info code {
+  background: var(--background-modifier-form-field);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+/* ── 底部状态栏一键同步 ── */
+.si-push-status-bar {
+  cursor: pointer;
+  padding: 0 8px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.si-push-status-bar:hover {
+  color: var(--text-accent);
+  background: var(--background-modifier-hover);
+}
+.si-push-status-icon {
+  display: inline-flex;
+  align-items: center;
+}
+.si-push-status-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.si-push-status-label {
+  line-height: 1;
+}
+
+/* ── 树状勾选推送 ── */
+.si-push-tree-modal .modal-content,
+.si-push-tree-modal-body {
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+.si-push-tree-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.si-push-tree-search {
+  flex: 1 1 200px;
+  min-width: 160px;
+  padding: 6px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+}
+.si-push-tree-toolbar-btns {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.si-push-tree-count {
+  margin-left: auto;
+  color: var(--text-accent);
+  font-weight: 600;
+  font-size: 13px;
+}
+.si-push-tree-host {
+  flex: 1 1 auto;
+  min-height: 320px;
+  max-height: 52vh;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 6px 0;
+  background: var(--background-secondary);
+}
+.si-push-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding-right: 10px;
+  font-size: 13px;
+}
+.si-push-tree-row:hover {
+  background: var(--background-modifier-hover);
+}
+.si-push-tree-twisty {
+  width: 16px;
+  text-align: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  user-select: none;
+  flex: 0 0 16px;
+}
+.si-push-tree-check {
+  margin: 0;
+  cursor: pointer;
+}
+.si-push-tree-icon {
+  flex: 0 0 auto;
+  line-height: 1;
+}
+.si-push-tree-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.si-push-tree-label.is-folder {
+  cursor: pointer;
+  font-weight: 500;
+}
+.si-push-tree-label.is-file {
+  color: var(--text-normal);
+}
+
+/* 文末同步 ID：尽量不抢视觉 */
+.markdown-preview-view .sipush-meta,
+.markdown-source-view .sipush-meta,
+.cm-contentContainer .sipush-meta,
+.sipush-meta {
+  display: block !important;
+  margin-top: 2.5em !important;
+  margin-bottom: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  background: transparent !important;
+  font-size: 9px !important;
+  line-height: 1.2 !important;
+  color: var(--text-faint) !important;
+  opacity: 0.35 !important;
+  user-select: text;
+  pointer-events: none;
+}

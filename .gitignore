@@ -1,0 +1,11 @@
+# Build outputs
+*.zip
+node_modules/
+dist/
+
+# Plugin runtime settings (may contain apiToken & note paths)
+data.json
+
+# OS
+.DS_Store
+Thumbs.db

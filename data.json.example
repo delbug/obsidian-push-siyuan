@@ -1,0 +1,21 @@
+{
+  "serverUrl": "http://127.0.0.1:6806",
+  "apiToken": "",
+  "defaultNotebookId": "",
+  "defaultPath": "/Obsidian/",
+  "pushFrontmatter": false,
+  "docMapping": {},
+  "syncConflictMode": "ask",
+  "maxSyncHistory": 20,
+  "syncHistory": [],
+  "preserveFolderStructure": true,
+  "syncAssets": true,
+  "rewriteWikilinks": true,
+  "assetsDirPath": "/assets/",
+  "oneClickAction": "vault",
+  "notebookCache": [],
+  "maxDocDepth": 6,
+  "failedQueue": [],
+  "pushJob": null,
+  "needsPushIdFooterMigration": true
+}
