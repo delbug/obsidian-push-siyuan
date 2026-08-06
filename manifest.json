@@ -1,9 +1,9 @@
 {
   "id": "obsidian-si-push",
   "name": "SiPush - 思源同步",
-  "version": "1.1.0",
+  "version": "2.1.0",
   "minAppVersion": "0.15.0",
-  "description": "Obsidian ↔ 思源笔记双向同步 — 全库推送、媒体资源、双链、冲突处理",
+  "description": "Obsidian ↔ 思源笔记同步 — 增量/自动推送、全库迁移、媒体资源、双链、冲突处理",
   "author": "wenyi",
   "authorUrl": "",
   "isDesktopOnly": true,

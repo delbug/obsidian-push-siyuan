@@ -36,8 +36,8 @@ const DEFAULT_SETTINGS = {
   assetsDirPath: "/assets/",
   // vault 相对路径 → 思源 assets 路径（避免重复上传产生多份副本）
   assetMap: {},
-  // 一键同步默认动作：vault = 全库推送，current = 仅当前笔记
-  oneClickAction: "vault",
+  // 一键同步默认动作：vault = 全库推送，incremental = 仅新/变更，current = 仅当前笔记
+  oneClickAction: "incremental",
   // 缓存笔记本列表，打开设置时无需每次点刷新才能看到名称
   notebookCache: [],
   // 思源文档树最大深度（叶子文档可以在第 7 层；第 7 层下不能再建子文档）
@@ -52,6 +52,17 @@ const DEFAULT_SETTINGS = {
   autoRepairAfterPush: true,
   // 是否仍需把 custom-si-push-id 从 frontmatter 迁到文末
   needsPushIdFooterMigration: true,
+  // 本地推送索引：path → { hash, mtime, size, pushId, at }，用于增量跳过未改笔记
+  pushIndex: {},
+  pushIndexSeeded: false,
+  // B：自动增量同步
+  autoSyncEnabled: false,
+  // 间隔（分钟），可自由填写：1 / 20 / 30 / 60 …
+  autoSyncIntervalMin: 30,
+  // 保存/新建 md 时记入待同步队列（到点一并推）
+  autoSyncWatchFiles: true,
+  // 思源离线时积压的待推路径
+  pendingSyncQueue: [],
 };
 
 const HASH_ATTR = "si-push-content-hash";
@@ -140,6 +151,18 @@ function stripSiTitle(text) {
 function utcSec() { return Math.floor(Date.now() / 1000); }
 /** 让出事件循环，保证进度条/状态栏能刷新 */
 function yieldUi() { return new Promise(r => setTimeout(r, 0)); }
+/** 暂停/取消触发的中断（不算推送失败） */
+function isSiPushAbortError(e) {
+  if (!e) return false;
+  if (e.name === "SiPushAbort" || e.name === "AbortError") return true;
+  const msg = String(e.message || e);
+  return msg === "SIPUSH_ABORTED" || /The user aborted a request/i.test(msg) || /aborted/i.test(msg);
+}
+function makeSiPushAbortError() {
+  const e = new Error("SIPUSH_ABORTED");
+  e.name = "SiPushAbort";
+  return e;
+}
 function formatTime(sec) {
   const d = new Date(sec * 1000);
   return d.toLocaleString("zh-CN", { hour12: false });
@@ -387,20 +410,29 @@ function stripSiYuanFrontmatter(content) {
 // SiYuan API 封装 (V2 修复版)
 // ═══════════════════════════════════════════════════════════════════
 class SiYuanApi {
-  constructor(url, token) {
+  constructor(url, token, getSignal) {
     this.url = url.replace(/\/+$/, "");
     this.token = token;
+    // 可选：() => AbortSignal，用于暂停/取消时打断卡住的网络请求
+    this.getSignal = typeof getSignal === "function" ? getSignal : null;
+  }
+
+  _signal() {
+    try { return this.getSignal ? this.getSignal() : undefined; } catch (e) { return undefined; }
   }
 
   async request(endpoint, payload) {
     const headers = { "Content-Type": "application/json" };
     if (this.token) headers["Authorization"] = "Token " + this.token;
     let resp;
+    const signal = this._signal();
     try {
       resp = await fetch(this.url + endpoint, {
         method: "POST", headers, body: JSON.stringify(payload),
+        signal,
       });
     } catch (e) {
+      if (isSiPushAbortError(e) || (signal && signal.aborted)) throw makeSiPushAbortError();
       throw new Error("无法连接思源: " + e.message);
     }
     // 只跳过 204 No Content（无响应体），不做 Content-Length 判断
@@ -570,9 +602,11 @@ class SiYuanApi {
     const headers = {};
     if (this.token) headers["Authorization"] = "Token " + this.token;
     let resp;
+    const signal = this._signal();
     try {
-      resp = await fetch(this.url + "/api/asset/upload", { method: "POST", headers, body: form });
+      resp = await fetch(this.url + "/api/asset/upload", { method: "POST", headers, body: form, signal });
     } catch (e) {
+      if (isSiPushAbortError(e) || (signal && signal.aborted)) throw makeSiPushAbortError();
       throw new Error("上传资源失败: " + e.message);
     }
     if (!resp.ok) {
@@ -1765,6 +1799,7 @@ class PushControlModal extends Modal {
       }
       box.createEl("p", {
         text: `本轮 ✅${(job.results && job.results.synced) || 0}  ❌${(job.results && job.results.failed) || 0}` +
+          ((job.results && job.results.skipped) ? `  ⏭️${job.results.skipped}` : "") +
           ((job.results && job.results.assets) ? `  🖼️${job.results.assets}` : "") +
           ((job.results && job.results.repairNote) ? `  🔧${job.results.repairNote}` : ""),
       });
@@ -1788,6 +1823,20 @@ class PushControlModal extends Modal {
     if (failN > 0) {
       box.createEl("p", { cls: "si-push-error", text: `失败队列积压 ${failN} 篇，可在下方查看 / 重试` });
     }
+    const pendingN = (this.plugin.settings.pendingSyncQueue || []).length;
+    if (pendingN > 0) {
+      box.createEl("p", {
+        cls: "si-push-doc-preview",
+        text: `待同步队列 ${pendingN} 篇（思源离线时积压；开思源后点增量推送或等自动同步）`,
+      });
+    }
+    if (this.plugin.settings.autoSyncEnabled) {
+      const min = this.plugin.normalizeAutoSyncIntervalMin(this.plugin.settings.autoSyncIntervalMin);
+      box.createEl("p", {
+        cls: "si-push-doc-preview",
+        text: `自动增量已开启：每 ${min} 分钟检查一次新文档/变更`,
+      });
+    }
   }
 
   render() {
@@ -1810,7 +1859,11 @@ class PushControlModal extends Modal {
 
     contentEl.createEl("h3", { text: "开始推送" });
     const startActs = contentEl.createDiv({ cls: "si-push-conflict-actions" });
-    mkBtn(startActs, "🌲 树状勾选推送", "mod-cta").onclick = () => {
+    mkBtn(startActs, "⚡ 增量推送（仅新/变更）", "mod-cta").onclick = () => {
+      if (!this.plugin.ensureConfigured()) return;
+      this.plugin.pushIncremental({ openControl: true });
+    };
+    mkBtn(startActs, "🌲 树状勾选推送").onclick = () => {
       this.close();
       this.plugin.openVaultTreeSelect();
     };
@@ -1849,10 +1902,15 @@ class PushControlModal extends Modal {
       this.plugin.oneClickSync();
     };
 
-    contentEl.createEl("h3", { text: "任务控制" });
+    contentEl.createEl("h3", { text: "任务控制（暂停/取消立刻生效）" });
     const ctrl = contentEl.createDiv({ cls: "si-push-conflict-actions" });
-    mkBtn(ctrl, "⏸ 暂停").onclick = async () => { await this.plugin.pausePushJob(); this.refreshProgress(); };
-    mkBtn(ctrl, "▶️ 继续", "mod-cta").onclick = () => { this.plugin.resumePushJob(); };
+    mkBtn(ctrl, "⏸ 立刻暂停", "mod-cta").onclick = async () => {
+      try { await this.plugin.pausePushJob(); } catch (e) {
+        new Notice("暂停失败: " + (e.message || e), 6000);
+      }
+      this.render();
+    };
+    mkBtn(ctrl, "▶️ 继续").onclick = () => { this.plugin.resumePushJob(); };
     mkBtn(ctrl, "从指定位置重推").onclick = () => {
       const paths = (this.plugin.settings.pushJob && this.plugin.settings.pushJob.paths)
         || this.plugin.listPushableFiles().map(f => f.path);
@@ -1864,7 +1922,12 @@ class PushControlModal extends Modal {
       if (!this.plugin.ensureConfigured()) return;
       this.plugin.rewriteWikilinksOnly();
     };
-    mkBtn(ctrl, "取消任务").onclick = async () => { await this.plugin.cancelPushJob(); this.refreshProgress(); };
+    mkBtn(ctrl, "⏹ 立刻取消").onclick = async () => {
+      try { await this.plugin.cancelPushJob(); } catch (e) {
+        new Notice("取消失败: " + (e.message || e), 6000);
+      }
+      this.render();
+    };
 
     contentEl.createEl("h3", { text: "失败队列 / 其它" });
     const more = contentEl.createDiv({ cls: "si-push-conflict-actions" });
@@ -2025,7 +2088,7 @@ function pluginBuildPath(plugin, fileOrTitle) {
 class SiPushPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
-    this.api = new SiYuanApi(this.settings.serverUrl, this.settings.apiToken);
+    this.api = this.createApi();
     this.isSyncing = false;
     this.statusBarEl = null;
 
@@ -2053,7 +2116,9 @@ class SiPushPlugin extends Plugin {
       callback: () => this.batchSync() });
     this.addCommand({ id: "push-all-vault", name: "一键全库推送到思源", icon: "upload-cloud",
       callback: () => this.pushAllVault() });
-    this.addCommand({ id: "one-click-sync", name: "全库同步到思源", icon: "upload-cloud",
+    this.addCommand({ id: "push-incremental", name: "增量推送到思源（仅新文档/有改动）", icon: "git-commit",
+      callback: () => this.pushIncremental({ openControl: true }) });
+    this.addCommand({ id: "one-click-sync", name: "同步到思源（按设置）", icon: "upload-cloud",
       callback: () => this.oneClickSync() });
     this.addCommand({ id: "push-control", name: "打开推送控制台", icon: "folders",
       callback: () => this.openPushControl() });
@@ -2115,6 +2180,34 @@ class SiPushPlugin extends Plugin {
     } else {
       this.refreshStatusBar();
     }
+    // 监听新建/修改，供自动增量入队
+    this.registerEvent(this.app.vault.on("create", (f) => this.onVaultFileChanged(f)));
+    this.registerEvent(this.app.vault.on("modify", (f) => this.onVaultFileChanged(f)));
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+      if (oldPath && this.settings.pushIndex && this.settings.pushIndex[oldPath]) {
+        this.settings.pushIndex[f.path] = this.settings.pushIndex[oldPath];
+        delete this.settings.pushIndex[oldPath];
+        this._pushIndexDirty = true;
+      }
+      if (oldPath && Array.isArray(this.settings.pendingSyncQueue)) {
+        const i = this.settings.pendingSyncQueue.indexOf(oldPath);
+        if (i >= 0) this.settings.pendingSyncQueue[i] = f.path;
+        this._pendingQueueDirty = true;
+      }
+      this.onVaultFileChanged(f);
+    }));
+    this.registerEvent(this.app.vault.on("delete", (f) => {
+      if (!f || !f.path) return;
+      if (this.settings.pushIndex && this.settings.pushIndex[f.path]) {
+        delete this.settings.pushIndex[f.path];
+        this._pushIndexDirty = true;
+      }
+      if (Array.isArray(this.settings.pendingSyncQueue)) {
+        this.settings.pendingSyncQueue = this.settings.pendingSyncQueue.filter(p => p !== f.path);
+        this._pendingQueueDirty = true;
+      }
+    }));
+
     // 布局就绪后，把全库顶部 custom-si-push-id 挪到文末（一次性）
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.needsPushIdFooterMigration === false) return;
@@ -2123,9 +2216,19 @@ class SiPushPlugin extends Plugin {
           console.warn("[SiPush] ID 迁移失败:", e);
         });
       }, 1200);
+      // 启动自动增量定时器；若有离线队列且思源在线，稍后补推
+      window.setTimeout(() => {
+        this.startAutoSyncTimer();
+        if (this.settings.autoSyncEnabled && (this.settings.pendingSyncQueue || []).length) {
+          this.runAutoSyncTick().catch(() => {});
+        }
+      }, 2500);
     });
   }
   onunload() {
+    this.stopAutoSyncTimer();
+    this.flushPushIndexIfNeeded(true).catch(() => {});
+    this.flushPendingQueueIfNeeded(true).catch(() => {});
     this.statusBarEl = null;
   }
   async loadSettings() {
@@ -2138,6 +2241,16 @@ class SiPushPlugin extends Plugin {
     this.settings.assetMap = (saved.assetMap && typeof saved.assetMap === "object")
       ? Object.assign({}, saved.assetMap)
       : {};
+    this.settings.pushIndex = (saved.pushIndex && typeof saved.pushIndex === "object")
+      ? Object.assign({}, saved.pushIndex)
+      : {};
+    this.settings.pendingSyncQueue = Array.isArray(saved.pendingSyncQueue)
+      ? saved.pendingSyncQueue.slice()
+      : [];
+    const interval = parseInt(saved.autoSyncIntervalMin, 10);
+    this.settings.autoSyncIntervalMin = Number.isFinite(interval) && interval >= 1
+      ? Math.min(interval, 24 * 60)
+      : 30;
     if (saved.pushJob && typeof saved.pushJob === "object") {
       this.settings.pushJob = Object.assign({}, saved.pushJob);
       if (Array.isArray(saved.pushJob.paths)) this.settings.pushJob.paths = saved.pushJob.paths.slice();
@@ -2168,7 +2281,67 @@ class SiPushPlugin extends Plugin {
       this.settings.assetsDirPath = fixedAssetsDir;
     }
   }
-  async saveSettings() { await this.saveData(this.settings); this.api = new SiYuanApi(this.settings.serverUrl, this.settings.apiToken); }
+  createApi() {
+    return new SiYuanApi(
+      this.settings.serverUrl,
+      this.settings.apiToken,
+      () => this.getPushAbortSignal()
+    );
+  }
+  async saveSettings() {
+    await this.saveData(this.settings);
+    this.api = this.createApi();
+  }
+
+  getPushAbortSignal() {
+    return this._abortController ? this._abortController.signal : undefined;
+  }
+
+  /** 是否应立刻停下推送循环（暂停/取消后为 true） */
+  shouldAbortPush() {
+    if (this._pauseRequested || this._forceStop) return true;
+    const job = this.settings.pushJob;
+    if (job && job.status && job.status !== "running") return true;
+    if (this._abortController && this._abortController.signal.aborted) return true;
+    return false;
+  }
+
+  throwIfAborted() {
+    if (this.shouldAbortPush()) throw makeSiPushAbortError();
+  }
+
+  /**
+   * 最高优先级：立刻暂停/取消。
+   * - 马上把任务标为 paused 并落盘（UI 立刻可见）
+   * - AbortController 打断卡住的 fetch（含大附件上传）
+   * - 不依赖「当前这篇跑完」
+   */
+  async forceStopPush(kind) {
+    kind = kind === "cancel" ? "cancel" : "pause";
+    this._pauseRequested = true;
+    this._forceStop = kind;
+    this._cancelFlushWikilinks = false; // 取消绝不阻塞在双链回写上
+    this._pendingRestart = null;
+
+    // 打断进行中的网络请求
+    try {
+      if (this._abortController) this._abortController.abort();
+    } catch (e) { /* ignore */ }
+
+    const job = this.settings.pushJob;
+    if (job) {
+      job.status = "paused";
+      job.updatedAt = utcSec();
+      // 落盘必须尽量成功；失败也不妨碍内存态已停
+      try { await this.saveSettings(); } catch (e) {
+        console.warn("[SiPush] forceStop 落盘失败:", e);
+      }
+    }
+    this.isSyncing = false;
+    this.refreshStatusBar();
+    try { this.openPushControl({ forceRender: true }); } catch (e) { /* ignore */ }
+    return job;
+  }
 
   /** 检查思源配置是否齐全；未配置时提示并返回 false */
   ensureConfigured() {
@@ -2188,8 +2361,10 @@ class SiPushPlugin extends Plugin {
     if (!this.ensureConfigured()) return;
     if (this.settings.oneClickAction === "current") {
       await this.syncCurrentNote();
-    } else {
+    } else if (this.settings.oneClickAction === "vault") {
       await this.pushAllVault();
+    } else {
+      await this.pushIncremental({ openControl: true });
     }
   }
 
@@ -2233,7 +2408,15 @@ class SiPushPlugin extends Plugin {
       }
     } else {
       const n = (this.settings.failedQueue || []).length;
-      this.setStatusBarText(n > 0 ? `同步到思源 · 失败${n}` : "同步到思源");
+      const pending = (this.settings.pendingSyncQueue || []).length;
+      const parts = [];
+      if (this.settings.autoSyncEnabled) {
+        const min = this.normalizeAutoSyncIntervalMin(this.settings.autoSyncIntervalMin);
+        parts.push(`自动${min}分`);
+      }
+      if (pending > 0) parts.push(`待推${pending}`);
+      if (n > 0) parts.push(`失败${n}`);
+      this.setStatusBarText(parts.length ? `同步到思源 · ${parts.join(" · ")}` : "同步到思源");
     }
     // 控制台打开时同步刷新进度
     if (this._controlModal && typeof this._controlModal.refreshProgress === "function") {
@@ -2395,6 +2578,250 @@ class SiPushPlugin extends Plugin {
     await this.startPushJob({ paths: files.map(f => f.path), label: "全库推送" });
   }
 
+  /** 规范化自动同步间隔（分钟） */
+  normalizeAutoSyncIntervalMin(v) {
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n) || n < 1) return 1;
+    return Math.min(n, 24 * 60);
+  }
+
+  /** 轻量探测思源 Kernel 是否可达 */
+  async isSiYuanOnline() {
+    try {
+      await this.api.getNotebooks();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  peekPushIdSync(file, content) {
+    if (!file) return null;
+    if (this._pushIdByPath && this._pushIdByPath.has(file.path)) {
+      return this._pushIdByPath.get(file.path);
+    }
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    if (fm && fm[PUSH_ID_KEY]) return fm[PUSH_ID_KEY];
+    if (content != null) return extractPushIdFromContent(content);
+    return null;
+  }
+
+  rememberPushIndex(file, hash, pushId) {
+    if (!file || !file.path) return;
+    if (!this.settings.pushIndex || typeof this.settings.pushIndex !== "object") {
+      this.settings.pushIndex = {};
+    }
+    this.settings.pushIndex[file.path] = {
+      hash: hash || "",
+      mtime: Math.floor((file.mtime || 0) / 1000),
+      size: (file.stat && file.stat.size) || 0,
+      pushId: pushId || null,
+      at: utcSec(),
+    };
+    this._pushIndexDirty = true;
+  }
+
+  async flushPushIndexIfNeeded(force) {
+    if (!force && !this._pushIndexDirty) return;
+    this._pushIndexDirty = false;
+    try { await this.saveSettings(); } catch (e) {
+      console.warn("[SiPush] 保存 pushIndex 失败:", e);
+    }
+  }
+
+  /**
+   * 首次启用增量：把「已有关联 ID」的笔记按当前 mtime 记入索引，避免误当成全库待推。
+   * 没有 ID 的笔记保持未索引 → 下次增量会推送。
+   */
+  async ensurePushIndexSeeded() {
+    if (this.settings.pushIndexSeeded) return;
+    if (!this.settings.pushIndex) this.settings.pushIndex = {};
+    const existing = Object.keys(this.settings.pushIndex).length;
+    if (existing > 0) {
+      this.settings.pushIndexSeeded = true;
+      await this.saveSettings();
+      return;
+    }
+    const files = this.listPushableFiles("");
+    let seeded = 0;
+    new Notice(`首次增量：正在建立本地索引（${files.length} 篇）…`, 4000);
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      try {
+        let content = "";
+        try { content = await this.app.vault.cachedRead(file); } catch (e) {
+          content = await this.app.vault.read(file);
+        }
+        const id = this.peekPushIdSync(file, content);
+        if (!id) continue;
+        this.settings.pushIndex[file.path] = {
+          hash: "",
+          mtime: Math.floor((file.mtime || 0) / 1000),
+          size: (file.stat && file.stat.size) || 0,
+          pushId: id,
+          at: utcSec(),
+        };
+        seeded++;
+      } catch (e) { /* ignore */ }
+      if (i % 80 === 0) await yieldUi();
+    }
+    this.settings.pushIndexSeeded = true;
+    this._pushIndexDirty = false;
+    await this.saveSettings();
+    new Notice(`本地索引已建立：已同步过的 ${seeded} 篇将跳过，仅推新笔记/有改动的笔记`, 7000);
+  }
+
+  /** 收集需要推送的路径：新文档 + mtime/size 有变化 */
+  async collectChangedPaths() {
+    await this.ensurePushIndexSeeded();
+    const files = this.listPushableFiles("");
+    const index = this.settings.pushIndex || {};
+    const out = [];
+    for (const file of files) {
+      const meta = index[file.path];
+      const mtime = Math.floor((file.mtime || 0) / 1000);
+      const size = (file.stat && file.stat.size) || 0;
+      if (meta && meta.mtime === mtime && meta.size === size) continue;
+      out.push(file.path);
+    }
+    // 合并离线积压队列
+    const pending = this.settings.pendingSyncQueue || [];
+    for (const p of pending) {
+      if (p && out.indexOf(p) < 0) out.push(p);
+    }
+    out.sort((a, b) => a.localeCompare(b));
+    return out;
+  }
+
+  enqueuePendingSync(path) {
+    if (!path || path.startsWith(".obsidian/") || path.startsWith(".trash/")) return;
+    if (!/\.md$/i.test(path)) return;
+    if (!this.settings.pendingSyncQueue) this.settings.pendingSyncQueue = [];
+    if (this.settings.pendingSyncQueue.indexOf(path) >= 0) return;
+    this.settings.pendingSyncQueue.push(path);
+    this._pendingQueueDirty = true;
+  }
+
+  async flushPendingQueueIfNeeded(force) {
+    if (!force && !this._pendingQueueDirty) return;
+    this._pendingQueueDirty = false;
+    try { await this.saveSettings(); } catch (e) { /* ignore */ }
+  }
+
+  /**
+   * A：增量推送——只推新文档 / 有改动的文档
+   */
+  async pushIncremental(opts) {
+    opts = opts || {};
+    if (!this.ensureConfigured()) return;
+    if (this._jobLoopRunning) {
+      new Notice("已有推送在进行，请先暂停/取消，或等结束后再增量推送");
+      return;
+    }
+    const online = await this.isSiYuanOnline();
+    if (!online) {
+      const paths = await this.collectChangedPaths();
+      for (const p of paths) this.enqueuePendingSync(p);
+      await this.flushPendingQueueIfNeeded(true);
+      new Notice(
+        `思源未连接：已把 ${paths.length || (this.settings.pendingSyncQueue || []).length} 篇记入待同步队列，开思源后会自动/手动推送`,
+        8000
+      );
+      this.refreshStatusBar();
+      return;
+    }
+    const paths = await this.collectChangedPaths();
+    if (!paths.length) {
+      new Notice("没有需要同步的新文档或变更文档 ✅");
+      return;
+    }
+    await this.startPushJob({
+      paths,
+      label: `增量推送（${paths.length} 篇）`,
+      incremental: true,
+      skipUnchanged: true,
+      openControl: opts.openControl !== false,
+    });
+  }
+
+  /** B：到点执行自动增量 */
+  async runAutoSyncTick() {
+    if (!this.settings.autoSyncEnabled) return;
+    if (this._jobLoopRunning || this.isSyncing) return;
+    if (this._autoSyncRunning) return;
+    this._autoSyncRunning = true;
+    try {
+      if (!this.settings.serverUrl || !this.settings.defaultNotebookId) return;
+      const online = await this.isSiYuanOnline();
+      if (!online) {
+        // 离线：把当前变更记入队列，下次在线再推
+        const paths = await this.collectChangedPaths();
+        for (const p of paths) this.enqueuePendingSync(p);
+        await this.flushPendingQueueIfNeeded(true);
+        this.refreshStatusBar();
+        return;
+      }
+      const paths = await this.collectChangedPaths();
+      if (!paths.length) {
+        this.refreshStatusBar();
+        return;
+      }
+      new Notice(`自动增量：发现 ${paths.length} 篇，开始推送…`, 4000);
+      await this.startPushJob({
+        paths,
+        label: `自动增量（${paths.length} 篇）`,
+        incremental: true,
+        skipUnchanged: true,
+        openControl: false,
+      });
+    } catch (e) {
+      console.warn("[SiPush] 自动增量失败:", e);
+    } finally {
+      this._autoSyncRunning = false;
+      this.refreshStatusBar();
+    }
+  }
+
+  startAutoSyncTimer() {
+    this.stopAutoSyncTimer();
+    if (!this.settings.autoSyncEnabled) {
+      this.refreshStatusBar();
+      return;
+    }
+    const min = this.normalizeAutoSyncIntervalMin(this.settings.autoSyncIntervalMin);
+    this.settings.autoSyncIntervalMin = min;
+    const ms = min * 60 * 1000;
+    this._autoSyncTimer = window.setInterval(() => {
+      this.runAutoSyncTick().catch(e => console.warn("[SiPush] auto tick:", e));
+    }, ms);
+    this._autoSyncNextAt = Date.now() + ms;
+    console.log("[SiPush] 自动增量已开启，间隔", min, "分钟");
+    this.refreshStatusBar();
+  }
+
+  stopAutoSyncTimer() {
+    if (this._autoSyncTimer) {
+      window.clearInterval(this._autoSyncTimer);
+      this._autoSyncTimer = null;
+    }
+    this._autoSyncNextAt = 0;
+  }
+
+  onVaultFileChanged(file) {
+    if (!file || !(file instanceof TFile)) return;
+    if (file.extension !== "md") return;
+    if (file.path.startsWith(".obsidian/") || file.path.startsWith(".trash/")) return;
+    if (!this.settings.autoSyncEnabled || this.settings.autoSyncWatchFiles === false) return;
+    this.enqueuePendingSync(file.path);
+    // 索引里清掉旧 mtime，确保下次 collect 能抓到
+    if (this.settings.pushIndex && this.settings.pushIndex[file.path]) {
+      const cur = this.settings.pushIndex[file.path];
+      cur.mtime = -1;
+      this._pushIndexDirty = true;
+    }
+    this._pendingQueueDirty = true;
+  }
+
   async pushFolder(folderPath) {
     const files = this.listPushableFiles(folderPath);
     if (!files.length) {
@@ -2431,16 +2858,15 @@ class SiPushPlugin extends Plugin {
     new StartFromSuggestModal(this.app, paths, (path) => this.restartPushFrom(path), this).open();
   }
 
-  async startPushJob({ paths, label, startPath }) {
+  async startPushJob({ paths, label, startPath, incremental, skipUnchanged, openControl }) {
     if (!this.ensureConfigured()) return;
     if (!paths || !paths.length) { new Notice("没有可推送的笔记"); return; }
 
     if (this._jobLoopRunning) {
-      // 正在跑：登记为暂停后重启，避免直接开新任务失败
-      this._pendingRestart = { paths, label, startPath };
-      this._pauseRequested = true;
-      this.openPushControl({ forceRender: true });
-      new Notice("当前推送将先暂停，然后从新任务重新开始…");
+      // 正在跑：强制立刻停掉，再开新任务（绝不卡在当前网络请求上）
+      this._pendingRestart = { paths, label, startPath, incremental, skipUnchanged, openControl };
+      await this.forceStopPush("pause");
+      new Notice("当前推送已立刻暂停，将自动开始新任务…");
       return;
     }
 
@@ -2462,30 +2888,54 @@ class SiPushPlugin extends Plugin {
       repairCurrent: 0,
       repairTotal: 2,
       repairDetail: "",
+      incremental: !!incremental,
+      skipUnchanged: skipUnchanged !== false && !!incremental,
       results: { synced: 0, failed: 0, conflicts: 0, deleted: 0, skipped: 0, assets: 0, details: [] },
       createdAt: utcSec(),
       updatedAt: utcSec(),
     };
     this._pauseRequested = false;
+    this._forceStop = null;
+    this._cancelFlushWikilinks = false;
     this._pendingRestart = null;
+    // 新任务用新的 AbortController；暂停/取消会 abort 掉进行中的请求
+    this._abortController = new AbortController();
+    // 清掉即将推送的离线队列项
+    if (this.settings.pendingSyncQueue && this.settings.pendingSyncQueue.length) {
+      const set = new Set(paths);
+      this.settings.pendingSyncQueue = this.settings.pendingSyncQueue.filter(p => !set.has(p));
+    }
     await this.saveSettings();
-    // 先打开/刷新控制台，再跑任务，保证进度条能实时看见
-    this.openPushControl({ forceRender: true });
+    if (openControl !== false) this.openPushControl({ forceRender: true });
     this.refreshStatusBar();
     new Notice(`开始${label || "推送"}：共 ${paths.length} 篇` + (startPath ? `（从 ${startPath} 起）` : ""), 5000);
-    // 让弹窗完成首帧渲染后再进入长循环
     await new Promise(r => window.setTimeout(r, 80));
     await this.runPushJobLoop();
   }
 
   async pausePushJob() {
     const job = this.settings.pushJob;
-    if (!job || job.status !== "running") {
+    if (!job || !job.paths || !job.paths.length) {
+      new Notice("没有可暂停的推送任务");
+      return;
+    }
+    if (job.status === "paused" && !this._jobLoopRunning) {
+      new Notice("已是暂停状态");
+      this.refreshStatusBar();
+      this.openPushControl({ forceRender: true });
+      return;
+    }
+    if (job.status === "done" && !this.jobHasUnfinishedWork(job)) {
       new Notice("当前没有进行中的推送");
       return;
     }
-    this._pauseRequested = true;
-    new Notice("将在当前这篇完成后暂停…");
+    await this.forceStopPush("pause");
+    const cur = job.phase === "wikilinks" ? (job.wikiCursor || 0) : (job.cursor || 0);
+    new Notice(
+      `⏸ 已暂停：${job.phase === "wikilinks" ? "双链" : (job.phase === "repair" ? "收尾" : "上传")} ${cur}/${job.paths.length}` +
+        (this._jobLoopRunning ? "（已中断当前网络请求）" : ""),
+      6000
+    );
   }
 
   async resumePushJob() {
@@ -2498,7 +2948,7 @@ class SiPushPlugin extends Plugin {
       new Notice("当前任务已结束，请重新开始推送");
       return;
     }
-    if (job.status === "running" && this._jobLoopRunning) {
+    if (job.status === "running" && this._jobLoopRunning && !this.shouldAbortPush()) {
       new Notice("推送已在进行中");
       return;
     }
@@ -2515,6 +2965,9 @@ class SiPushPlugin extends Plugin {
     job.status = "running";
     job.updatedAt = utcSec();
     this._pauseRequested = false;
+    this._forceStop = null;
+    this._cancelFlushWikilinks = false;
+    this._abortController = new AbortController();
     await this.saveSettings();
     this.refreshStatusBar();
     this.openPushControl({ forceRender: true });
@@ -2533,55 +2986,18 @@ class SiPushPlugin extends Plugin {
   }
 
   async cancelPushJob() {
-    this._pauseRequested = true;
     const job = this.settings.pushJob;
     if (!job || !job.paths || !job.paths.length) {
       new Notice("没有可取消的推送任务");
       return;
     }
-
-    // 若循环还在跑：先停在当前篇，再为「已上传部分」回写双链，最后标为 paused（可继续）
-    if (this._jobLoopRunning) {
-      this._cancelFlushWikilinks = true;
-      new Notice("将在当前篇完成后停止，并为已上传部分写入双链…", 6000);
-      return;
-    }
-
-    await this.finalizeInterruptedPush(job, { flushWikilinks: true, asPaused: true });
-  }
-
-  /**
-   * 中断后的收尾：可选为已上传文档回写双链，并保留任务为 paused 以便继续。
-   * 不再把未完成任务直接标 idle，避免控制台显示「没有任务」且思源里双链缺失。
-   */
-  async finalizeInterruptedPush(job, opts) {
-    opts = opts || {};
-    if (!job) return;
-    const uploaded = Math.min(job.cursor || 0, (job.paths || []).length);
-    if (opts.flushWikilinks && this.settings.rewriteWikilinks !== false && uploaded > 0) {
-      try {
-        new Notice(`正在为已上传的 ${uploaded} 篇写入双链…`, 4000);
-        const files = job.paths.slice(0, uploaded)
-          .map(p => this.app.vault.getAbstractFileByPath(p))
-          .filter(f => f instanceof TFile);
-        await this.ensureSiDocMap(files);
-        const n = await this.rewriteVaultWikilinks(files);
-        new Notice(`已为已上传部分写入双链 ${n} 篇。点「继续」可接着推剩余笔记。`, 8000);
-      } catch (e) {
-        console.warn("[SiPush] 中断后双链回写失败:", e);
-        new Notice("已停止推送，但双链回写失败: " + (e.message || e), 8000);
-      }
-    } else if (uploaded > 0 && this.settings.rewriteWikilinks !== false) {
-      new Notice("已停止。已上传内容尚未写双链，请点「仅回写双链」或「继续」。", 8000);
-    } else {
-      new Notice("已停止推送任务（已完成的不会回滚）");
-    }
-    job.status = opts.asPaused === false ? "idle" : "paused";
-    job.updatedAt = utcSec();
-    await this.saveSettings();
-    this.isSyncing = false;
-    this.refreshStatusBar();
-    this.openPushControl({ forceRender: true });
+    // 取消必须立刻成功：不等当前篇、不跑双链回写、打断网络请求
+    await this.forceStopPush("cancel");
+    const uploaded = Math.min(job.cursor || 0, job.paths.length);
+    const hint = uploaded > 0 && this.settings.rewriteWikilinks !== false
+      ? `已停。已上传 ${uploaded} 篇可点「仅回写双链」或「继续」。`
+      : "已取消推送（已完成的不会回滚）。";
+    new Notice("⏹ " + hint, 8000);
   }
 
   /**
@@ -2653,31 +3069,48 @@ class SiPushPlugin extends Plugin {
     try {
       // 阶段 1：上传
       while (job.status === "running" && job.phase === "upload" && job.cursor < job.paths.length) {
-        if (this._pauseRequested) {
-          job.status = "paused";
+        if (this.shouldAbortPush()) {
+          if (job.status === "running") job.status = "paused";
           job.updatedAt = utcSec();
-          await this.saveSettings();
+          try { await this.saveSettings(); } catch (e) { /* ignore */ }
           this.refreshStatusBar();
-          if (this._cancelFlushWikilinks) {
-            this._cancelFlushWikilinks = false;
-            await this.finalizeInterruptedPush(job, { flushWikilinks: true, asPaused: true });
-          } else {
-            new Notice(`已暂停：上传 ${job.cursor}/${job.paths.length}` +
-              ((job.cursor || 0) > 0 ? "（双链阶段未跑完前，思源里 [[链接]] 可能还不能点）" : ""));
-          }
           break;
         }
 
         const filePath = job.paths[job.cursor];
         const file = this.app.vault.getAbstractFileByPath(filePath);
         this.refreshStatusBar();
+        let aborted = false;
 
         try {
+          this.throwIfAborted();
           if (!(file instanceof TFile)) throw new Error("文件不存在");
           const pushId = await this.getOrCreatePushId(file);
+          this.throwIfAborted();
           let md = await this.app.vault.read(file);
           if (!this.settings.pushFrontmatter) md = stripFM(md);
+          this.throwIfAborted();
           const prepared = await this.prepareMarkdownForPush(file, md, { skipWikilinks: false });
+          this.throwIfAborted();
+          const prepHash = contentHash((prepared.md || "").replace(/^# .*\n*/, "").trim());
+          // 增量：内容哈希与本地索引一致则跳过实际上传
+          if (job.skipUnchanged) {
+            const idx = (this.settings.pushIndex || {})[file.path];
+            if (idx && idx.hash && idx.hash === prepHash) {
+              this.rememberPushIndex(file, prepHash, pushId);
+              job.results.skipped = (job.results.skipped || 0) + 1;
+              job.results.details.push({
+                title: file.path,
+                status: "success",
+                direction: "跳过(无变更)",
+              });
+              job.cursor++;
+              job.updatedAt = utcSec();
+              this.refreshStatusBar();
+              await yieldUi();
+              continue;
+            }
+          }
           job.results.assets += prepared.assetCount || 0;
           if (prepared.assetErrors && prepared.assetErrors.length) {
             for (const ae of prepared.assetErrors) {
@@ -2691,7 +3124,9 @@ class SiPushPlugin extends Plugin {
           }
           const siPath = pluginBuildPath(this, file);
           const docId = await this.pushToSiYuan(file, siPath, prepared.md, pushId, file.basename, { quiet: true, prepared: true });
+          this.throwIfAborted();
           if (docId) this.registerSiDoc(file, docId);
+          this.rememberPushIndex(file, prepHash, pushId);
           job.results.synced++;
           job.results.details.push({
             title: file.path,
@@ -2700,13 +3135,26 @@ class SiPushPlugin extends Plugin {
               ((prepared.assetErrors && prepared.assetErrors.length) ? ` ⚠附件失败${prepared.assetErrors.length}` : ""),
           });
         } catch (e) {
-          job.results.failed++;
-          job.results.details.push({
-            title: filePath,
-            status: "error",
-            direction: "异常",
-            detail: (e.message || String(e)).substring(0, 120),
-          });
+          if (isSiPushAbortError(e) || this.shouldAbortPush()) {
+            aborted = true;
+          } else {
+            job.results.failed++;
+            job.results.details.push({
+              title: filePath,
+              status: "error",
+              direction: "异常",
+              detail: (e.message || String(e)).substring(0, 120),
+            });
+          }
+        }
+
+        // 被暂停/取消打断：不推进 cursor，便于继续时重试当前篇
+        if (aborted || this.shouldAbortPush()) {
+          if (job.status === "running") job.status = "paused";
+          job.updatedAt = utcSec();
+          try { await this.saveSettings(); } catch (e) { /* ignore */ }
+          this.refreshStatusBar();
+          break;
         }
 
         job.cursor++;
@@ -2717,8 +3165,10 @@ class SiPushPlugin extends Plugin {
           const fails = job.results.details.filter(d => d.status === "error");
           const oks = job.results.details.filter(d => d.status === "success").slice(-30);
           job.results.details = fails.concat(oks);
-          await this.saveSettings();
+          this._pushIndexDirty = true;
+          try { await this.saveSettings(); this._pushIndexDirty = false; } catch (e) { /* ignore */ }
         }
+        await yieldUi();
       }
 
       if (job.status === "running" && job.phase === "upload" && job.cursor >= job.paths.length) {
@@ -2728,7 +3178,16 @@ class SiPushPlugin extends Plugin {
         if (this.settings.rewriteWikilinks !== false) {
           new Notice("开始写入双链…", 3000);
           // 双链前建立「全库已关联文档 → 思源 ID」映射，否则跨文件夹互链会失败
-          await this.ensureSiDocMap(this.app.vault.getMarkdownFiles());
+          try {
+            await this.ensureSiDocMap(this.app.vault.getMarkdownFiles());
+          } catch (e) {
+            if (isSiPushAbortError(e) || this.shouldAbortPush()) {
+              if (job.status === "running") job.status = "paused";
+              try { await this.saveSettings(); } catch (e2) { /* ignore */ }
+            } else {
+              throw e;
+            }
+          }
         } else {
           job.phase = "done";
         }
@@ -2741,31 +3200,26 @@ class SiPushPlugin extends Plugin {
         this.settings.rewriteWikilinks !== false &&
         job.wikiCursor < job.paths.length
       ) {
-        if (this._pauseRequested) {
-          job.status = "paused";
+        if (this.shouldAbortPush()) {
+          if (job.status === "running") job.status = "paused";
           job.updatedAt = utcSec();
-          await this.saveSettings();
+          try { await this.saveSettings(); } catch (e) { /* ignore */ }
           this.refreshStatusBar();
-          if (this._cancelFlushWikilinks) {
-            this._cancelFlushWikilinks = false;
-            // 双链阶段已在进行：直接保留 paused，无需再 flush
-            new Notice(`已停止：双链 ${job.wikiCursor}/${job.paths.length}（可点继续）`);
-            this.openPushControl({ forceRender: true });
-          } else {
-            new Notice(`已暂停：双链 ${job.wikiCursor}/${job.paths.length}`);
-          }
           break;
         }
 
         const filePath = job.paths[job.wikiCursor];
         const file = this.app.vault.getAbstractFileByPath(filePath);
         this.refreshStatusBar();
+        let aborted = false;
         try {
+          this.throwIfAborted();
           if (file instanceof TFile) {
             let md = await this.app.vault.read(file);
             if (!this.settings.pushFrontmatter) md = stripFM(md);
             if (/\[\[[^\]]+\]\]/.test(md) || /siyuan:\/\/blocks\//i.test(md)) {
               const prepared = await this.prepareMarkdownForPush(file, md, { skipWikilinks: false });
+              this.throwIfAborted();
               if (/\(\([0-9]{14}-[0-9a-z]{7}/i.test(prepared.md)) {
                 const pushId = await this.getOrCreatePushId(file);
                 await this.pushToSiYuan(file, pluginBuildPath(this, file), prepared.md, pushId, file.basename, {
@@ -2775,11 +3229,25 @@ class SiPushPlugin extends Plugin {
             }
           }
         } catch (e) {
-          console.warn("[SiPush] 双链回写失败:", filePath, e.message);
+          if (isSiPushAbortError(e) || this.shouldAbortPush()) {
+            aborted = true;
+          } else {
+            console.warn("[SiPush] 双链回写失败:", filePath, e.message);
+          }
+        }
+        if (aborted || this.shouldAbortPush()) {
+          if (job.status === "running") job.status = "paused";
+          job.updatedAt = utcSec();
+          try { await this.saveSettings(); } catch (e) { /* ignore */ }
+          this.refreshStatusBar();
+          break;
         }
         job.wikiCursor++;
         this.refreshStatusBar();
-        if (job.wikiCursor % 10 === 0) await this.saveSettings();
+        if (job.wikiCursor % 10 === 0) {
+          try { await this.saveSettings(); } catch (e) { /* ignore */ }
+        }
+        await yieldUi();
       }
 
       if (
@@ -2790,6 +3258,10 @@ class SiPushPlugin extends Plugin {
       ) {
         // 阶段 3：推送收尾自动修复（音视频写法 + 附件断链），避免导入后再点一堆修复
         if (this.settings.autoRepairAfterPush !== false && !job.repairDone) {
+          if (this.shouldAbortPush()) {
+            if (job.status === "running") job.status = "paused";
+            try { await this.saveSettings(); } catch (e) { /* ignore */ }
+          } else {
           job.phase = "repair";
           job.repairCurrent = 0;
           job.repairTotal = 2;
@@ -2801,6 +3273,7 @@ class SiPushPlugin extends Plugin {
             const repair = await this.runPostPushRepairs({
               quiet: true,
               onProgress: (info) => {
+                if (this.shouldAbortPush()) throw makeSiPushAbortError();
                 const msg = (info && info.message) || "";
                 job.repairDetail = ((info && info.detail) || msg || "").slice(0, 160);
                 if (typeof info.current === "number" && typeof info.total === "number" && info.total > 0) {
@@ -2812,6 +3285,10 @@ class SiPushPlugin extends Plugin {
                 this.refreshStatusBar();
               },
             });
+            if (this.shouldAbortPush()) {
+              if (job.status === "running") job.status = "paused";
+              try { await this.saveSettings(); } catch (e) { /* ignore */ }
+            } else {
             job.results.repairAvFixed = (repair && repair.av && repair.av.fixed) || 0;
             job.results.repairBrokenPairs = (repair && repair.broken && repair.broken.pairCount) || 0;
             job.results.repairBrokenDocs = (repair && repair.broken && repair.broken.docsTouched) || 0;
@@ -2819,19 +3296,29 @@ class SiPushPlugin extends Plugin {
             if (job.results.repairAvFixed) noteParts.push(`音视频${job.results.repairAvFixed}`);
             if (job.results.repairBrokenPairs) noteParts.push(`断链${job.results.repairBrokenPairs}`);
             job.results.repairNote = noteParts.length ? noteParts.join("+") : "无";
+            job.repairDone = true;
+            }
           } catch (e) {
-            console.warn("[SiPush] 推送收尾修复失败:", e);
-            job.results.repairNote = "失败";
-            job.results.details.push({
-              title: "(收尾修复)",
-              status: "error",
-              direction: "收尾修复",
-              detail: (e.message || String(e)).substring(0, 120),
-            });
+            if (isSiPushAbortError(e) || this.shouldAbortPush()) {
+              if (job.status === "running") job.status = "paused";
+              try { await this.saveSettings(); } catch (e2) { /* ignore */ }
+            } else {
+              console.warn("[SiPush] 推送收尾修复失败:", e);
+              job.results.repairNote = "失败";
+              job.results.details.push({
+                title: "(收尾修复)",
+                status: "error",
+                direction: "收尾修复",
+                detail: (e.message || String(e)).substring(0, 120),
+              });
+              job.repairDone = true;
+            }
           }
-          job.repairDone = true;
+          }
         }
 
+        // 仅在仍为 running 时标记完成（暂停/取消后绝不能误标 done）
+        if (job.status === "running") {
         job.phase = "done";
         job.status = "done";
         job.updatedAt = utcSec();
@@ -2844,12 +3331,15 @@ class SiPushPlugin extends Plugin {
           ? ` · 🔧${job.results.repairNote}`
           : "";
         new Notice(`推送完成：✅ ${job.results.synced} / ❌ ${job.results.failed}${repairHint}`, 7000);
+        }
       }
     } finally {
       this._jobLoopRunning = false;
       this.isSyncing = false;
-      // 暂停时也落盘 assetMap，避免恢复后重复上传产生多份附件
+      // 暂停时也落盘 assetMap / pushIndex，避免恢复后重复上传或重复增量
       await this.flushAssetMapIfNeeded(true);
+      await this.flushPushIndexIfNeeded(true);
+      await this.flushPendingQueueIfNeeded(true);
       if (!this.settings.pushJob || this.settings.pushJob.status !== "running") {
         this._assetCache = null;
         if (this.settings.pushJob && this.settings.pushJob.status === "done") this._siDocMap = null;
@@ -2861,6 +3351,7 @@ class SiPushPlugin extends Plugin {
       if (pending) {
         this._pendingRestart = null;
         this._pauseRequested = false;
+        this._forceStop = null;
         // 下一轮事件循环启动，避免 finally 重入
         setTimeout(() => {
           this.startPushJob(pending).catch(e => console.error("[SiPush] pending restart failed:", e));
@@ -2918,7 +3409,11 @@ class SiPushPlugin extends Plugin {
       }
     }
 
+    let i = 0;
     for (const file of need) {
+      this.throwIfAborted();
+      i++;
+      if (i % 30 === 0) await yieldUi();
       let pushId = null;
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
       if (fm && fm[PUSH_ID_KEY]) pushId = fm[PUSH_ID_KEY];
@@ -2926,7 +3421,9 @@ class SiPushPlugin extends Plugin {
         try {
           const md = await this.app.vault.read(file);
           pushId = extractPushIdFromContent(md);
-        } catch (e) { /* ignore */ }
+        } catch (e) {
+          if (isSiPushAbortError(e)) throw e;
+        }
       }
       if (!pushId) continue;
       try {
@@ -2936,7 +3433,9 @@ class SiPushPlugin extends Plugin {
         }
         const doc = await this.api.findDoc(pushId);
         if (doc && doc.id) this.registerSiDoc(file, doc.id);
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        if (isSiPushAbortError(e)) throw e;
+      }
     }
     return this._siDocMap;
   }
@@ -3166,10 +3665,12 @@ class SiPushPlugin extends Plugin {
   }
 
   async uploadVaultFile(file) {
+    this.throwIfAborted();
     if (!this._assetCache) this._assetCache = new Map();
     if (this._assetCache.has(file.path)) return this._assetCache.get(file.path);
 
     await this.loadAssetIndex();
+    this.throwIfAborted();
 
     // 1) 路径级缓存（mtime/size 未变）
     const byPath = this.lookupIndexByVaultPath(file);
@@ -3188,14 +3689,17 @@ class SiPushPlugin extends Plugin {
     try {
       data = await this.app.vault.readBinary(file);
     } catch (e) {
+      if (isSiPushAbortError(e)) throw e;
       throw new Error("读取附件失败: " + file.path + " — " + e.message);
     }
+    this.throwIfAborted();
     if (!data || (meta.size > 1024 && data.byteLength < 100)) {
       throw new Error("附件内容异常（可能是损坏的占位文件）: " + file.path);
     }
 
     // 2) 内容哈希：同内容直接复用最早那份，不再上传
     const hash = await sha256Hex(data);
+    this.throwIfAborted();
     const byHash = this.lookupIndexByHash(hash);
     if (byHash && byHash.siPath) {
       // 可选：确认思源侧还在（失败则继续上传）
@@ -3204,6 +3708,7 @@ class SiPushPlugin extends Plugin {
         const st = await this.api.statAsset(byHash.siPath);
         if (!st || !(st.size > 0)) stillThere = false;
       } catch (e) {
+        if (isSiPushAbortError(e)) throw e;
         stillThere = false;
       }
       if (stillThere) {
@@ -3225,11 +3730,14 @@ class SiPushPlugin extends Plugin {
     const assetsDir = resolveAssetsDirPath(this.settings.assetsDirPath);
     let assetPath = null;
     try {
+      this.throwIfAborted();
       assetPath = await this.api.uploadAsset(body, uploadName, assetsDir);
     } catch (e) {
+      if (isSiPushAbortError(e) || this.shouldAbortPush()) throw makeSiPushAbortError();
       if (sizeMb >= 15) {
         console.warn("[SiPush] 大附件上传失败，重试一次:", file.path, e.message);
         await new Promise(r => setTimeout(r, 1000));
+        this.throwIfAborted();
         assetPath = await this.api.uploadAsset(body, uploadName, assetsDir);
       } else {
         throw e;
@@ -3271,6 +3779,7 @@ class SiPushPlugin extends Plugin {
 
     const replaceOne = async (fullMatch, file, alias) => {
       if (seenReplace.has(fullMatch)) return;
+      this.throwIfAborted();
       try {
         const before = this._assetCache && this._assetCache.has(file.path);
         await this.loadAssetIndex();
@@ -3281,6 +3790,7 @@ class SiPushPlugin extends Plugin {
         out = out.split(fullMatch).join(formatAssetMarkdown(file, assetPath, alias));
         seenReplace.add(fullMatch);
       } catch (e) {
+        if (isSiPushAbortError(e) || this.shouldAbortPush()) throw makeSiPushAbortError();
         const msg = (e && e.message) || String(e);
         console.warn("[SiPush] 资源上传失败:", file.path, msg);
         errors.push({ path: file.path, error: msg });
@@ -3735,6 +4245,7 @@ class SiPushPlugin extends Plugin {
           existingDoc, path, finalMd, pushId, title, hash, mtime
         );
         this.rememberSiDoc(pushId, docId, file);
+        if (file) this.rememberPushIndex(file, hash, pushId);
         if (!opts.quiet) new Notice("📤 → 思源 ✅ 推送更新成功!");
         return docId;
       } catch (e) {
@@ -3752,6 +4263,7 @@ class SiPushPlugin extends Plugin {
       await this.api.setSyncInfo(docId, hash, mtime);
       await this.api.setAttrs(docId, { "custom-si-push-id": pushId, title: title });
       this.rememberSiDoc(pushId, docId, file);
+      if (file) this.rememberPushIndex(file, hash, pushId);
 
       // 核验：同 pushId 是否已有更早文档（属性延迟时误建的合并回去）
       try {
@@ -3761,6 +4273,7 @@ class SiPushPlugin extends Plugin {
           await this.api.setSyncInfo(again.id, hash, mtime);
           await this.api.setAttrs(again.id, { "custom-si-push-id": pushId, title: title });
           this.rememberSiDoc(pushId, again.id, file);
+          if (file) this.rememberPushIndex(file, hash, pushId);
           console.warn("[SiPush] 检测到重复文档，已合并到已有文档:", again.id, "新建的是:", docId);
           return again.id;
         }
@@ -3776,6 +4289,7 @@ class SiPushPlugin extends Plugin {
           await this.api.setSyncInfo(byPath.id, hash, mtime);
           await this.api.setAttrs(byPath.id, { "custom-si-push-id": pushId, title: title });
           this.rememberSiDoc(pushId, byPath.id, file);
+          if (file) this.rememberPushIndex(file, hash, pushId);
           if (!opts.quiet) new Notice("📤 → 思源 ✅ 推送更新成功!");
           return byPath.id;
         }
@@ -4331,6 +4845,7 @@ class SiPushPlugin extends Plugin {
       total: Math.max(1, uniq.length),
     });
     for (const id of uniq) {
+      if (this.shouldAbortPush && this.shouldAbortPush()) throw makeSiPushAbortError();
       scanned++;
       onProgress({
         message: `修复音视频 ${scanned}/${uniq.length}`,
@@ -4349,6 +4864,7 @@ class SiPushPlugin extends Plugin {
         await this.api.updateDoc(id, next);
         fixed++;
       } catch (e) {
+        if (isSiPushAbortError(e)) throw e;
         failed++;
         console.warn("[SiPush] 修复音视频失败:", id, e.message);
       }
@@ -4391,6 +4907,7 @@ class SiPushPlugin extends Plugin {
     const page = 3000;
     const re = /assets\/([^\s)\]\"'<>]+)/gi;
     for (let round = 0; round < 40; round++) {
+      if (this.shouldAbortPush && this.shouldAbortPush()) throw makeSiPushAbortError();
       const rows = await this.api.request("/api/query/sql", {
         stmt:
           "SELECT root_id, markdown FROM blocks WHERE markdown LIKE '%assets/%' " +
@@ -4454,6 +4971,7 @@ class SiPushPlugin extends Plugin {
 
     const touched = new Set();
     for (let i = 0; i < pairs.length; i++) {
+      if (this.shouldAbortPush && this.shouldAbortPush()) throw makeSiPushAbortError();
       const p = pairs[i];
       onProgress({
         message: `修复断链 ${i + 1}/${pairs.length}`,
@@ -4466,6 +4984,7 @@ class SiPushPlugin extends Plugin {
       try {
         let changed = 0;
         for (const id of p.docs) {
+          if (this.shouldAbortPush && this.shouldAbortPush()) throw makeSiPushAbortError();
           try {
             let md = await this.api.getDocMd(id);
             if (!md) continue;
@@ -4478,6 +4997,7 @@ class SiPushPlugin extends Plugin {
             changed++;
             replaceOps++;
           } catch (e) {
+            if (isSiPushAbortError(e)) throw e;
             console.warn("[SiPush] 断链修复单文档失败:", id, e.message);
           }
         }
@@ -4788,16 +5308,65 @@ class SiPushSettingTab extends PluginSettingTab {
         dd.onChange(async v => { this.plugin.settings.syncConflictMode = v; await this.plugin.saveSettings(); });
       });
 
-    containerEl.createEl("h3", { text: "📦 全库推送 / 资源与双链 (V2.1)" });
+    containerEl.createEl("h3", { text: "⚡ 增量 / 自动同步" });
 
     new Setting(containerEl).setName("一键同步动作")
       .setDesc("点击左侧云图标 / 底部「同步到思源」时执行的操作")
       .addDropdown(dd => {
-        dd.addOption("vault", "全库推送到思源（推荐）");
+        dd.addOption("incremental", "增量推送（仅新文档/有改动，推荐）");
+        dd.addOption("vault", "全库推送到思源");
         dd.addOption("current", "仅同步当前笔记");
-        dd.setValue(this.plugin.settings.oneClickAction || "vault");
+        dd.setValue(this.plugin.settings.oneClickAction || "incremental");
         dd.onChange(async v => { this.plugin.settings.oneClickAction = v; await this.plugin.saveSettings(); });
       });
+
+    new Setting(containerEl).setName("开启自动增量同步")
+      .setDesc("按下方间隔自动检查并推送新文档/有改动的笔记；思源未开时先入队，连上后再推")
+      .addToggle(t => t.setValue(!!this.plugin.settings.autoSyncEnabled)
+        .onChange(async v => {
+          this.plugin.settings.autoSyncEnabled = v;
+          await this.plugin.saveSettings();
+          this.plugin.startAutoSyncTimer();
+          this.display();
+        }));
+
+    new Setting(containerEl).setName("自动同步间隔（分钟）")
+      .setDesc("可自由填写，例如 1、20、30、60（最少 1 分钟，最多 1440=24 小时）")
+      .addText(t => t.setPlaceholder("30")
+        .setValue(String(this.plugin.settings.autoSyncIntervalMin || 30))
+        .onChange(async v => {
+          this.plugin.settings.autoSyncIntervalMin = this.plugin.normalizeAutoSyncIntervalMin(v);
+          await this.plugin.saveSettings();
+          if (this.plugin.settings.autoSyncEnabled) this.plugin.startAutoSyncTimer();
+        }));
+
+    new Setting(containerEl).setName("监听新建/保存")
+      .setDesc("开启后，新建或修改 Markdown 会记入待同步队列，到点一并增量推送")
+      .addToggle(t => t.setValue(this.plugin.settings.autoSyncWatchFiles !== false)
+        .onChange(async v => {
+          this.plugin.settings.autoSyncWatchFiles = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl).setName("立刻跑一次自动增量")
+      .setDesc("不等到下一个间隔，马上检查并推送")
+      .addButton(b => b.setButtonText("立即同步").setCta().onClick(() => {
+        this.plugin.runAutoSyncTick();
+      }));
+
+    const pendingN = (this.plugin.settings.pendingSyncQueue || []).length;
+    new Setting(containerEl)
+      .setName(pendingN ? `待同步队列：${pendingN} 篇` : "待同步队列为空")
+      .setDesc("思源离线时积压的路径；也可清空")
+      .addButton(b => b.setButtonText("清空队列").onClick(async () => {
+        this.plugin.settings.pendingSyncQueue = [];
+        await this.plugin.saveSettings();
+        this.plugin.refreshStatusBar();
+        new Notice("已清空待同步队列");
+        this.display();
+      }));
+
+    containerEl.createEl("h3", { text: "📦 全库推送 / 资源与双链 (V2.1)" });
 
     new Setting(containerEl).setName("保留文件夹结构")
       .setDesc("推送时尽量按 Obsidian 相对路径建文档；超过思源最大深度时自动压平（中间层用 __ 拼进文档名）")
