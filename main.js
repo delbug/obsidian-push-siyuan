@@ -48,6 +48,8 @@ const DEFAULT_SETTINGS = {
   failedQueue: [],
   // 可暂停/继续的推送任务断点
   pushJob: null,
+  // 推送结束自动修复：音视频 ![]→播放器、去重后附件断链
+  autoRepairAfterPush: true,
   // 是否仍需把 custom-si-push-id 从 frontmatter 迁到文末
   needsPushIdFooterMigration: true,
 };
@@ -627,8 +629,57 @@ class SiYuanApi {
         codeBlock: true,
         htmlBlock: true,
         inlineMemo: true,
+        math: true,
+        mathBlock: true,
       },
     });
+  }
+
+  /**
+   * findReplace 改不到 NodeAudio/NodeVideo 的 src。
+   * 对仍含旧路径的文档：导出 Markdown → 替换 → updateBlock。
+   */
+  async rewriteAssetRefsInDocs(fromPath, toPath, opts) {
+    opts = opts || {};
+    const from = normalizeAssetLinkPath(String(fromPath || "").replace(/^data\//, ""));
+    const to = normalizeAssetLinkPath(String(toPath || "").replace(/^data\//, ""));
+    if (!from || !to || from === to) return { docs: 0, changed: 0 };
+    const fromName = from.split("/").pop();
+    const toName = to.split("/").pop();
+    if (!fromName) return { docs: 0, changed: 0 };
+    const safe = fromName.replace(/'/g, "''");
+    const rows = await this.request("/api/query/sql", {
+      stmt:
+        "SELECT DISTINCT root_id FROM blocks WHERE markdown LIKE '%" + safe + "%' LIMIT 2000",
+    });
+    const ids = Array.from(new Set((Array.isArray(rows) ? rows : []).map(r => r && r.root_id).filter(Boolean)));
+    let changed = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      if (opts.onProgress) {
+        opts.onProgress({
+          message: opts.progressMessage || `改文档引用 ${i + 1}/${ids.length}`,
+          current: i + 1,
+          total: ids.length,
+          detail: fromName + " → " + toName,
+        });
+      }
+      try {
+        let md = await this.getDocMd(id);
+        if (!md || (md.indexOf(from) < 0 && md.indexOf(fromName) < 0)) continue;
+        let next = md.split(from).join(to);
+        if (next === md && fromName !== toName) {
+          next = md.split(fromName).join(toName);
+        }
+        if (next === md) continue;
+        await this.updateDoc(id, next);
+        changed++;
+      } catch (e) {
+        console.warn("[SiPush] 文档改引用失败:", id, from, "→", to, e.message);
+      }
+      await yieldUi();
+    }
+    return { docs: ids.length, changed };
   }
 
   async removeUnusedAsset(path) {
@@ -879,7 +930,13 @@ class AssetDedupModal extends Modal {
       const rescan = acts.createEl("button", { text: "重新扫描", cls: "mod-cta" });
       rescan.onclick = () => this.startScan();
     } else if (this.phase === "done") {
-      const rescan = acts.createEl("button", { text: "再扫一次", cls: "mod-cta" });
+      const repair = acts.createEl("button", { text: "🔗 修复附件断链", cls: "mod-cta" });
+      repair.onclick = () => {
+        this.close();
+        this.plugin.repairBrokenAssetRefs();
+      };
+      const rescan = acts.createEl("button", { text: "再扫一次" });
+      rescan.style.marginLeft = "8px";
       rescan.onclick = () => this.startScan();
     }
     const close = acts.createEl("button", { text: "关闭" });
@@ -947,7 +1004,7 @@ class AssetDedupModal extends Modal {
         stats: `改引用尝试 ${this.applyResult.replaced} · 失败 ${this.applyResult.failed}`,
       });
       this.render();
-      new Notice(`✅ 资源去重完成：删重复副本 ${this.applyResult.deleted} · 改引用 ${this.applyResult.replaced}`, 8000);
+      new Notice(`✅ 资源去重完成：删重复副本 ${this.applyResult.deleted} · 改引用 ${this.applyResult.replaced}。若仍有音频打不开，请点「修复附件断链」。`, 10000);
       try { this.plugin.refreshStatusBar(); } catch (e) { /* ignore */ }
     } catch (e) {
       this.phase = "report";
@@ -1060,6 +1117,13 @@ class SyncReportModal extends Modal {
       (r.skipped > 0 ? ` &nbsp; ⏭️ 跳过 ${r.skipped}` : "") +
       (r.assets > 0 ? ` &nbsp; 🖼️ 资源 ${r.assets}` : "") +
       (r.deleted > 0 ? ` &nbsp; 🗑️ 已删除 ${r.deleted}` : "") + `</p>` +
+      (r.repairNote
+        ? `<p>🔧 收尾修复：${r.repairNote}` +
+          ((r.repairAvFixed || r.repairBrokenPairs)
+            ? `（音视频 ${r.repairAvFixed || 0} · 断链路径 ${r.repairBrokenPairs || 0} · 文档 ${r.repairBrokenDocs || 0}）`
+            : "") +
+          `</p>`
+        : "") +
       (failN > 0 ? `<p class="si-push-error">失败已记入队列（当前积压 ${failN} 篇），可稍后重试</p>` : "");
     s.innerHTML = html;
 
@@ -1658,24 +1722,42 @@ class PushControlModal extends Modal {
     box.empty();
     const job = this.plugin.settings.pushJob;
     const looping = !!this.plugin._jobLoopRunning;
-    if (!job || job.status === "idle" || job.status === "done") {
+    const unfinished = this.plugin.jobHasUnfinishedWork(job);
+    // idle/done 但还有未跑完的上传/双链时，仍展示进度（避免取消后误以为「没有任务」）
+    if (!job || ((job.status === "idle" || job.status === "done") && !unfinished)) {
       box.createEl("p", { text: "当前没有进行中的推送任务" });
     } else {
       const total = Math.max(1, (job.paths || []).length);
-      const cur = job.phase === "wikilinks" ? (job.wikiCursor || 0) : (job.cursor || 0);
-      const shown = Math.min(cur, total);
-      const pct = Math.min(100, Math.round((shown / total) * 100));
-      const phaseText = job.phase === "wikilinks" ? "写入双链" : "上传文档";
+      const isRepair = job.phase === "repair";
+      const cur = isRepair
+        ? (job.repairCurrent || 0)
+        : (job.phase === "wikilinks" ? (job.wikiCursor || 0) : (job.cursor || 0));
+      const repairTotal = Math.max(1, job.repairTotal || 1);
+      const shown = isRepair ? Math.min(cur, repairTotal) : Math.min(cur, total);
+      const pctBase = isRepair ? repairTotal : total;
+      const pct = Math.min(100, Math.round((shown / pctBase) * 100));
+      const phaseText = isRepair
+        ? "收尾修复"
+        : (job.phase === "wikilinks" ? "写入双链" : "上传文档");
       let statusText = job.status === "paused" ? "已暂停 ⏸" : (job.status === "running" ? "进行中 ▶️" : job.status);
       if (job.status === "running" && looping) statusText = "后台推送中 ▶️";
+      if ((job.status === "idle" || job.status === "done") && unfinished) {
+        statusText = "未完成（可继续）⏸";
+      }
       box.createEl("p", { text: `状态：${statusText} · ${job.label || ""}` });
-      box.createEl("p", { text: `进度：${phaseText} ${shown}/${total}（${pct}%）` });
+      box.createEl("p", {
+        text: isRepair
+          ? `进度：${phaseText} ${shown}/${repairTotal}（${pct}%）`
+          : `进度：${phaseText} ${shown}/${total}（${pct}%）`,
+      });
 
       const bar = box.createDiv({ cls: "si-push-progress-bar" });
       const fill = bar.createDiv({ cls: "si-push-progress-fill" });
       fill.style.width = pct + "%";
 
-      if (job.paths && job.paths[Math.min(shown, total - 1)]) {
+      if (isRepair && job.repairDetail) {
+        box.createEl("p", { cls: "si-push-doc-preview", text: job.repairDetail });
+      } else if (!isRepair && job.paths && job.paths[Math.min(shown, total - 1)]) {
         box.createEl("p", {
           cls: "si-push-doc-preview",
           text: (job.status === "running" ? "正在处理：" : "当前/下一篇：") + job.paths[Math.min(shown, total - 1)],
@@ -1683,12 +1765,22 @@ class PushControlModal extends Modal {
       }
       box.createEl("p", {
         text: `本轮 ✅${(job.results && job.results.synced) || 0}  ❌${(job.results && job.results.failed) || 0}` +
-          ((job.results && job.results.assets) ? `  🖼️${job.results.assets}` : ""),
+          ((job.results && job.results.assets) ? `  🖼️${job.results.assets}` : "") +
+          ((job.results && job.results.repairNote) ? `  🔧${job.results.repairNote}` : ""),
       });
+      // 上传阶段中断时，思源里仍是 [[笔记]]，还没有 ((id)) 可点双链
+      if (unfinished && job.phase === "upload" && (job.cursor || 0) > 0) {
+        box.createEl("p", {
+          cls: "si-push-error",
+          text: "⚠ 双链尚未写入：上传中断时思源正文仍是 [[笔记]]。请点「继续」跑完，或点「仅回写双链」。",
+        });
+      }
       if (job.status === "running") {
         box.createEl("p", {
           cls: "si-push-doc-preview",
-          text: "提示：关闭控制台不会暂停，任务在后台继续；再打开即可看最新进度。",
+          text: isRepair
+            ? "正在自动修复音视频引用与附件断链，完成后会出报告。"
+            : "提示：关闭控制台不会暂停，任务在后台继续；再打开即可看最新进度。",
         });
       }
     }
@@ -1768,6 +1860,10 @@ class PushControlModal extends Modal {
       this.close();
       new StartFromSuggestModal(this.app, paths, (path) => this.plugin.restartPushFrom(path), this.plugin).open();
     };
+    mkBtn(ctrl, "🔗 仅回写双链").onclick = () => {
+      if (!this.plugin.ensureConfigured()) return;
+      this.plugin.rewriteWikilinksOnly();
+    };
     mkBtn(ctrl, "取消任务").onclick = async () => { await this.plugin.cancelPushJob(); this.refreshProgress(); };
 
     contentEl.createEl("h3", { text: "失败队列 / 其它" });
@@ -1795,6 +1891,10 @@ class PushControlModal extends Modal {
       if (!this.plugin.ensureConfigured()) return;
       this.close();
       this.plugin.openAssetDedup();
+    };
+    mkBtn(more, "🔗 修复附件断链", "mod-cta").onclick = () => {
+      if (!this.plugin.ensureConfigured()) return;
+      this.plugin.repairBrokenAssetRefs();
     };
     mkBtn(more, "🔊 修复音视频引用").onclick = () => {
       if (!this.plugin.ensureConfigured()) return;
@@ -1973,6 +2073,8 @@ class SiPushPlugin extends Plugin {
       callback: () => this.pickRestartFrom() });
     this.addCommand({ id: "cancel-push", name: "取消当前推送任务", icon: "x-square",
       callback: () => this.cancelPushJob() });
+    this.addCommand({ id: "rewrite-wikilinks-only", name: "仅回写双链到思源（不重传正文附件）", icon: "link-2",
+      callback: () => this.rewriteWikilinksOnly() });
     this.addCommand({ id: "force-push", name: "强制推送当前笔记到思源", icon: "upload-cloud",
       editorCallback: () => this.pushCurrentNote() });
     this.addCommand({ id: "pull-from-siyuan", name: "搜索思源文档并拉回", icon: "download-cloud",
@@ -1989,14 +2091,24 @@ class SiPushPlugin extends Plugin {
       callback: () => this.migrateAllPushIdsToFooter({ force: true }) });
     this.addCommand({ id: "dedup-siyuan-assets", name: "去重思源资源池（按内容哈希）", icon: "trash",
       callback: () => this.openAssetDedup() });
+    this.addCommand({ id: "repair-broken-asset-refs", name: "修复附件断链（去重后文档未更新）", icon: "link-2",
+      callback: () => this.repairBrokenAssetRefs() });
     this.addCommand({ id: "repair-siyuan-av-markup", name: "修复思源音视频引用（![]→播放器）", icon: "audio-file",
       callback: () => this.repairSiYuanAudioVideoMarkup() });
 
     this.addSettingTab(new SiPushSettingTab(this.app, this));
     this.loadAssetIndex().catch(e => console.warn("[SiPush] loadAssetIndex:", e));
     this.migrateFailedQueueFromHistory();
-    // 上次异常退出时若任务停在 running，改为 paused，方便继续
-    if (this.settings.pushJob && this.settings.pushJob.status === "running") {
+    // 上次异常退出 / 取消导致 idle 但未跑完：改为 paused，方便继续或回写双链
+    if (this.settings.pushJob && this.jobHasUnfinishedWork(this.settings.pushJob)) {
+      if (this.settings.pushJob.status === "running" || this.settings.pushJob.status === "idle") {
+        this.settings.pushJob.status = "paused";
+        this.saveSettings().then(() => this.refreshStatusBar());
+        new Notice("检测到未完成的推送任务（双链可能未写入）。可点「继续推送」或「仅回写双链」。", 10000);
+      } else {
+        this.refreshStatusBar();
+      }
+    } else if (this.settings.pushJob && this.settings.pushJob.status === "running") {
       this.settings.pushJob.status = "paused";
       this.saveSettings().then(() => this.refreshStatusBar());
       new Notice("检测到未完成的推送任务，已设为暂停。可点「继续推送」或打开推送控制台。", 8000);
@@ -2089,13 +2201,36 @@ class SiPushPlugin extends Plugin {
     this.statusBarEl.createSpan({ cls: "si-push-status-label", text: text || "同步到思源" });
   }
 
+  /** 任务是否还有未完成的上传 / 双链 / 收尾 */
+  jobHasUnfinishedWork(job) {
+    if (!job || !job.paths || !job.paths.length) return false;
+    if (job.status === "running" || job.status === "paused") return true;
+    if (job.phase === "repair" && !job.repairDone) return true;
+    if (job.phase === "wikilinks" && (job.wikiCursor || 0) < job.paths.length) return true;
+    if (job.phase === "upload" && (job.cursor || 0) < job.paths.length) return true;
+    // 上传已跑完但从未进入双链阶段（例如被标成 idle）
+    if (job.phase === "upload" && (job.cursor || 0) >= job.paths.length && this.settings.rewriteWikilinks !== false) {
+      return true;
+    }
+    return false;
+  }
+
   refreshStatusBar() {
     const job = this.settings.pushJob;
-    if (job && (job.status === "running" || job.status === "paused")) {
+    const unfinished = this.jobHasUnfinishedWork(job);
+    if (job && (job.status === "running" || job.status === "paused" || unfinished)) {
       const total = (job.paths || []).length;
-      const cur = job.phase === "wikilinks" ? (job.wikiCursor || 0) : (job.cursor || 0);
-      const tag = job.status === "paused" ? "已暂停" : (job.phase === "wikilinks" ? "双链" : "上传");
-      this.setStatusBarText(`${tag} ${Math.min(cur, total)}/${total}`);
+      if (job.phase === "repair") {
+        const t = Math.max(1, job.repairTotal || 1);
+        const c = Math.min(job.repairCurrent || 0, t);
+        this.setStatusBarText(`收尾修复 ${c}/${t}`);
+      } else {
+        const cur = job.phase === "wikilinks" ? (job.wikiCursor || 0) : (job.cursor || 0);
+        const tag = job.status === "paused" || (job.status !== "running" && unfinished)
+          ? "未完成"
+          : (job.phase === "wikilinks" ? "双链" : "上传");
+        this.setStatusBarText(`${tag} ${Math.min(cur, total)}/${total}`);
+      }
     } else {
       const n = (this.settings.failedQueue || []).length;
       this.setStatusBarText(n > 0 ? `同步到思源 · 失败${n}` : "同步到思源");
@@ -2212,7 +2347,8 @@ class SiPushPlugin extends Plugin {
   /** 第二遍：按已收集的思源文档 ID，把 [[笔记]] 写成 ((id "锚文本")) */
   async rewriteVaultWikilinks(files) {
     if (this.settings.rewriteWikilinks === false) return 0;
-    await this.ensureSiDocMap(files);
+    // 映射必须覆盖库内其它已关联文档，否则互链目标不在本次 files 里会转失败
+    await this.ensureSiDocMap(this.app.vault.getMarkdownFiles());
     let updated = 0;
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
@@ -2322,6 +2458,10 @@ class SiPushPlugin extends Plugin {
       cursor,
       wikiCursor: 0,
       phase: "upload",
+      repairDone: false,
+      repairCurrent: 0,
+      repairTotal: 2,
+      repairDetail: "",
       results: { synced: 0, failed: 0, conflicts: 0, deleted: 0, skipped: 0, assets: 0, details: [] },
       createdAt: utcSec(),
       updatedAt: utcSec(),
@@ -2354,18 +2494,31 @@ class SiPushPlugin extends Plugin {
       new Notice("没有可继续的推送任务，请先开始推送");
       return;
     }
+    if (!this.jobHasUnfinishedWork(job) && job.status !== "paused" && job.status !== "running") {
+      new Notice("当前任务已结束，请重新开始推送");
+      return;
+    }
     if (job.status === "running" && this._jobLoopRunning) {
       new Notice("推送已在进行中");
       return;
     }
     if (!this.ensureConfigured()) return;
+    // 上传已全部完成但停在 upload：直接进入双链阶段
+    if (
+      job.phase === "upload" &&
+      (job.cursor || 0) >= job.paths.length &&
+      this.settings.rewriteWikilinks !== false
+    ) {
+      job.phase = "wikilinks";
+      job.wikiCursor = job.wikiCursor || 0;
+    }
     job.status = "running";
     job.updatedAt = utcSec();
     this._pauseRequested = false;
     await this.saveSettings();
     this.refreshStatusBar();
     this.openPushControl({ forceRender: true });
-    new Notice(`继续推送：${job.phase === "wikilinks" ? "双链" : "上传"} ${job.phase === "wikilinks" ? job.wikiCursor : job.cursor}/${job.paths.length}`);
+    new Notice(`继续推送：${job.phase === "repair" ? "收尾修复" : (job.phase === "wikilinks" ? "双链" : "上传")} ${job.phase === "wikilinks" ? job.wikiCursor : (job.phase === "repair" ? (job.repairCurrent || 0) : job.cursor)}/${job.phase === "repair" ? (job.repairTotal || 2) : job.paths.length}`);
     await new Promise(r => window.setTimeout(r, 50));
     await this.runPushJobLoop();
   }
@@ -2382,14 +2535,102 @@ class SiPushPlugin extends Plugin {
   async cancelPushJob() {
     this._pauseRequested = true;
     const job = this.settings.pushJob;
-    if (job) {
-      job.status = "idle";
-      job.updatedAt = utcSec();
-      await this.saveSettings();
+    if (!job || !job.paths || !job.paths.length) {
+      new Notice("没有可取消的推送任务");
+      return;
     }
+
+    // 若循环还在跑：先停在当前篇，再为「已上传部分」回写双链，最后标为 paused（可继续）
+    if (this._jobLoopRunning) {
+      this._cancelFlushWikilinks = true;
+      new Notice("将在当前篇完成后停止，并为已上传部分写入双链…", 6000);
+      return;
+    }
+
+    await this.finalizeInterruptedPush(job, { flushWikilinks: true, asPaused: true });
+  }
+
+  /**
+   * 中断后的收尾：可选为已上传文档回写双链，并保留任务为 paused 以便继续。
+   * 不再把未完成任务直接标 idle，避免控制台显示「没有任务」且思源里双链缺失。
+   */
+  async finalizeInterruptedPush(job, opts) {
+    opts = opts || {};
+    if (!job) return;
+    const uploaded = Math.min(job.cursor || 0, (job.paths || []).length);
+    if (opts.flushWikilinks && this.settings.rewriteWikilinks !== false && uploaded > 0) {
+      try {
+        new Notice(`正在为已上传的 ${uploaded} 篇写入双链…`, 4000);
+        const files = job.paths.slice(0, uploaded)
+          .map(p => this.app.vault.getAbstractFileByPath(p))
+          .filter(f => f instanceof TFile);
+        await this.ensureSiDocMap(files);
+        const n = await this.rewriteVaultWikilinks(files);
+        new Notice(`已为已上传部分写入双链 ${n} 篇。点「继续」可接着推剩余笔记。`, 8000);
+      } catch (e) {
+        console.warn("[SiPush] 中断后双链回写失败:", e);
+        new Notice("已停止推送，但双链回写失败: " + (e.message || e), 8000);
+      }
+    } else if (uploaded > 0 && this.settings.rewriteWikilinks !== false) {
+      new Notice("已停止。已上传内容尚未写双链，请点「仅回写双链」或「继续」。", 8000);
+    } else {
+      new Notice("已停止推送任务（已完成的不会回滚）");
+    }
+    job.status = opts.asPaused === false ? "idle" : "paused";
+    job.updatedAt = utcSec();
+    await this.saveSettings();
     this.isSyncing = false;
     this.refreshStatusBar();
-    new Notice("已取消推送任务（已完成的不会回滚）");
+    this.openPushControl({ forceRender: true });
+  }
+
+  /**
+   * 仅把 [[笔记]] 写成思源 ((id "锚文本")) 并回写，不重跑全库上传。
+   * 优先处理当前任务已覆盖路径；否则处理全库已关联笔记。
+   */
+  async rewriteWikilinksOnly() {
+    if (!this.ensureConfigured()) return;
+    if (this.settings.rewriteWikilinks === false) {
+      new Notice("设置里已关闭「转换双链」，请先打开");
+      return;
+    }
+    if (this._jobLoopRunning || this.isSyncing) {
+      new Notice("请先暂停/等当前推送结束，再回写双链");
+      return;
+    }
+    const job = this.settings.pushJob;
+    let files;
+    let label;
+    if (job && job.paths && job.paths.length) {
+      const end = job.phase === "upload"
+        ? Math.max(job.cursor || 0, 0)
+        : job.paths.length;
+      const slice = end > 0 ? job.paths.slice(0, end) : job.paths.slice();
+      files = slice
+        .map(p => this.app.vault.getAbstractFileByPath(p))
+        .filter(f => f instanceof TFile);
+      label = `任务范围内 ${files.length} 篇`;
+    } else {
+      files = this.listPushableFiles("");
+      label = `全库 ${files.length} 篇`;
+    }
+    if (!files.length) {
+      new Notice("没有可回写双链的笔记");
+      return;
+    }
+    this.isSyncing = true;
+    this.setStatusBarText("写入双链…");
+    new Notice(`开始回写双链（${label}）…`, 4000);
+    try {
+      await this.ensureSiDocMap(files);
+      const n = await this.rewriteVaultWikilinks(files);
+      new Notice(`✅ 双链回写完成：更新 ${n} 篇（无 [[链接]] 的会跳过）`, 8000);
+    } catch (e) {
+      new Notice("❌ 双链回写失败: " + (e.message || e), 8000);
+    } finally {
+      this.isSyncing = false;
+      this.refreshStatusBar();
+    }
   }
 
   async runPushJobLoop() {
@@ -2404,12 +2645,9 @@ class SiPushPlugin extends Plugin {
     if (!this._docIdByPushId) this._docIdByPushId = new Map();
     if (!this._pushIdByPath) this._pushIdByPath = new Map();
 
-    // 从「双链阶段」恢复时，必须先重建文档 ID 映射
+    // 从「双链阶段」恢复时，必须先重建文档 ID 映射（全库，保证互链目标可解析）
     if (job.phase === "wikilinks" && this.settings.rewriteWikilinks !== false) {
-      const mapFiles = job.paths
-        .map(p => this.app.vault.getAbstractFileByPath(p))
-        .filter(f => f instanceof TFile);
-      await this.ensureSiDocMap(mapFiles);
+      await this.ensureSiDocMap(this.app.vault.getMarkdownFiles());
     }
 
     try {
@@ -2420,7 +2658,13 @@ class SiPushPlugin extends Plugin {
           job.updatedAt = utcSec();
           await this.saveSettings();
           this.refreshStatusBar();
-          new Notice(`已暂停：上传 ${job.cursor}/${job.paths.length}`);
+          if (this._cancelFlushWikilinks) {
+            this._cancelFlushWikilinks = false;
+            await this.finalizeInterruptedPush(job, { flushWikilinks: true, asPaused: true });
+          } else {
+            new Notice(`已暂停：上传 ${job.cursor}/${job.paths.length}` +
+              ((job.cursor || 0) > 0 ? "（双链阶段未跑完前，思源里 [[链接]] 可能还不能点）" : ""));
+          }
           break;
         }
 
@@ -2433,7 +2677,7 @@ class SiPushPlugin extends Plugin {
           const pushId = await this.getOrCreatePushId(file);
           let md = await this.app.vault.read(file);
           if (!this.settings.pushFrontmatter) md = stripFM(md);
-          const prepared = await this.prepareMarkdownForPush(file, md, { skipWikilinks: true });
+          const prepared = await this.prepareMarkdownForPush(file, md, { skipWikilinks: false });
           job.results.assets += prepared.assetCount || 0;
           if (prepared.assetErrors && prepared.assetErrors.length) {
             for (const ae of prepared.assetErrors) {
@@ -2483,11 +2727,8 @@ class SiPushPlugin extends Plugin {
         await this.saveSettings();
         if (this.settings.rewriteWikilinks !== false) {
           new Notice("开始写入双链…", 3000);
-          // 双链前先建立「全部任务文件 → 思源 ID」映射，否则同批互链会失败
-          const mapFiles = job.paths
-            .map(p => this.app.vault.getAbstractFileByPath(p))
-            .filter(f => f instanceof TFile);
-          await this.ensureSiDocMap(mapFiles);
+          // 双链前建立「全库已关联文档 → 思源 ID」映射，否则跨文件夹互链会失败
+          await this.ensureSiDocMap(this.app.vault.getMarkdownFiles());
         } else {
           job.phase = "done";
         }
@@ -2505,7 +2746,14 @@ class SiPushPlugin extends Plugin {
           job.updatedAt = utcSec();
           await this.saveSettings();
           this.refreshStatusBar();
-          new Notice(`已暂停：双链 ${job.wikiCursor}/${job.paths.length}`);
+          if (this._cancelFlushWikilinks) {
+            this._cancelFlushWikilinks = false;
+            // 双链阶段已在进行：直接保留 paused，无需再 flush
+            new Notice(`已停止：双链 ${job.wikiCursor}/${job.paths.length}（可点继续）`);
+            this.openPushControl({ forceRender: true });
+          } else {
+            new Notice(`已暂停：双链 ${job.wikiCursor}/${job.paths.length}`);
+          }
           break;
         }
 
@@ -2537,8 +2785,53 @@ class SiPushPlugin extends Plugin {
       if (
         job.status === "running" &&
         (job.phase === "done" ||
+          job.phase === "repair" ||
           (job.phase === "wikilinks" && (this.settings.rewriteWikilinks === false || job.wikiCursor >= job.paths.length)))
       ) {
+        // 阶段 3：推送收尾自动修复（音视频写法 + 附件断链），避免导入后再点一堆修复
+        if (this.settings.autoRepairAfterPush !== false && !job.repairDone) {
+          job.phase = "repair";
+          job.repairCurrent = 0;
+          job.repairTotal = 2;
+          job.repairDetail = "准备自动修复音视频与附件断链…";
+          await this.saveSettings();
+          this.refreshStatusBar();
+          new Notice("推送收尾：自动修复音视频引用与附件断链…", 4000);
+          try {
+            const repair = await this.runPostPushRepairs({
+              quiet: true,
+              onProgress: (info) => {
+                const msg = (info && info.message) || "";
+                job.repairDetail = ((info && info.detail) || msg || "").slice(0, 160);
+                if (typeof info.current === "number" && typeof info.total === "number" && info.total > 0) {
+                  const step = /断链|assets|枚举|引用/.test(msg) ? 1 : 0;
+                  const local = info.current / Math.max(1, info.total);
+                  job.repairCurrent = Math.min(2, Math.round((step + local) * 10) / 10);
+                  job.repairTotal = 2;
+                }
+                this.refreshStatusBar();
+              },
+            });
+            job.results.repairAvFixed = (repair && repair.av && repair.av.fixed) || 0;
+            job.results.repairBrokenPairs = (repair && repair.broken && repair.broken.pairCount) || 0;
+            job.results.repairBrokenDocs = (repair && repair.broken && repair.broken.docsTouched) || 0;
+            const noteParts = [];
+            if (job.results.repairAvFixed) noteParts.push(`音视频${job.results.repairAvFixed}`);
+            if (job.results.repairBrokenPairs) noteParts.push(`断链${job.results.repairBrokenPairs}`);
+            job.results.repairNote = noteParts.length ? noteParts.join("+") : "无";
+          } catch (e) {
+            console.warn("[SiPush] 推送收尾修复失败:", e);
+            job.results.repairNote = "失败";
+            job.results.details.push({
+              title: "(收尾修复)",
+              status: "error",
+              direction: "收尾修复",
+              detail: (e.message || String(e)).substring(0, 120),
+            });
+          }
+          job.repairDone = true;
+        }
+
         job.phase = "done";
         job.status = "done";
         job.updatedAt = utcSec();
@@ -2547,7 +2840,10 @@ class SiPushPlugin extends Plugin {
         await this.logSyncHistory(job.results);
         this.refreshStatusBar();
         new SyncReportModal(this.app, job.results, this).open();
-        new Notice(`推送完成：✅ ${job.results.synced} / ❌ ${job.results.failed}`, 6000);
+        const repairHint = job.results.repairNote && job.results.repairNote !== "无"
+          ? ` · 🔧${job.results.repairNote}`
+          : "";
+        new Notice(`推送完成：✅ ${job.results.synced} / ❌ ${job.results.failed}${repairHint}`, 7000);
       }
     } finally {
       this._jobLoopRunning = false;
@@ -2586,7 +2882,7 @@ class SiPushPlugin extends Plugin {
       assetCount = r.count || 0;
       assetErrors = r.errors || [];
     }
-    // 第一遍建文档时可跳过双链；第二遍再用文档 ID 写成 ((id "锚文本"))
+    // 第一遍也会尽量转双链（目标已在映射中的）；第二遍再用全库 ID 补全
     if (!opts.skipWikilinks && this.settings.rewriteWikilinks !== false) {
       out = this.rewriteWikilinks(sourceFile, out);
     }
@@ -2604,8 +2900,25 @@ class SiPushPlugin extends Plugin {
   async ensureSiDocMap(files) {
     if (!this._siDocMap) this._siDocMap = { byPath: new Map(), byName: new Map() };
     const list = files || this.app.vault.getMarkdownFiles();
-    for (const file of list) {
-      if (this._siDocMap.byPath.has(file.path)) continue;
+    const need = list.filter(f => f && !this._siDocMap.byPath.has(f.path));
+    if (!need.length) return this._siDocMap;
+
+    // 批量拉取笔记本内已关联文档，避免逐篇 findDoc
+    let byPushId = null;
+    if (need.length > 20) {
+      try {
+        const rows = await this.api.searchLinked(this.settings.defaultNotebookId);
+        byPushId = new Map();
+        for (const r of (Array.isArray(rows) ? rows : [])) {
+          if (r && r.push_id && r.id) byPushId.set(String(r.push_id), r.id);
+        }
+      } catch (e) {
+        console.warn("[SiPush] 批量拉取关联文档失败，回退逐篇查询:", e.message);
+        byPushId = null;
+      }
+    }
+
+    for (const file of need) {
       let pushId = null;
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
       if (fm && fm[PUSH_ID_KEY]) pushId = fm[PUSH_ID_KEY];
@@ -2617,6 +2930,10 @@ class SiPushPlugin extends Plugin {
       }
       if (!pushId) continue;
       try {
+        if (byPushId && byPushId.has(String(pushId))) {
+          this.registerSiDoc(file, byPushId.get(String(pushId)));
+          continue;
+        }
         const doc = await this.api.findDoc(pushId);
         if (doc && doc.id) this.registerSiDoc(file, doc.id);
       } catch (e) { /* ignore */ }
@@ -3892,17 +4209,34 @@ class SiPushPlugin extends Plugin {
         });
         await yieldUi();
         try {
-          // 不论扫描是否标「已引用」，都先尝试全局改链，避免漏扫导致断链
+          // 1) 全局 findReplace（对图片/链接有效；音视频 NodeAudio 常无效）
           try {
             await this.api.findReplaceAssetPath(dup.linkPath, keep.linkPath);
-            replaced++;
-            replacements.push({ from: dup.linkPath, to: keep.linkPath });
           } catch (e) {
-            console.warn("[SiPush] 改引用失败(继续删副本):", dup.linkPath, e.message);
+            console.warn("[SiPush] findReplace 失败:", dup.linkPath, e.message);
           }
           try {
             await this.api.findReplaceAssetPath("data/" + dup.linkPath, "data/" + keep.linkPath);
           } catch (e) { /* ignore */ }
+
+          // 2) 文档级改写：覆盖 <audio>/<video> src（去重断链的根因修复）
+          try {
+            const rw = await this.api.rewriteAssetRefsInDocs(dup.linkPath, keep.linkPath, {
+              onProgress: (info) => onProgress({
+                message: `改文档引用 ${done}/${totalDups}`,
+                current: done,
+                total: Math.max(1, totalDups),
+                detail: (info && info.detail) || `${dup.name} → ${keep.name}`,
+                stats: `已删 ${deleted} · 改引用 ${replaced} · 失败 ${failed}`,
+              }),
+            });
+            if (rw && rw.changed > 0) replaced += rw.changed;
+            else replaced++; // 至少记一次尝试
+            replacements.push({ from: dup.linkPath, to: keep.linkPath });
+          } catch (e) {
+            console.warn("[SiPush] 文档改引用失败(继续删副本):", dup.linkPath, e.message);
+            replacements.push({ from: dup.linkPath, to: keep.linkPath });
+          }
 
           try {
             await this.api.removeFile(dup.workspacePath);
@@ -3965,68 +4299,243 @@ class SiPushPlugin extends Plugin {
     return { replaced, deleted, failed, skippedReplace: 0, mapFixed };
   }
 
-  // ── 修复思源里被写成图片语法的音视频（显示「找不到」） ──
-  async repairSiYuanAudioVideoMarkup() {
-    if (!this.ensureConfigured()) return;
-    if (this._repairingAv) { new Notice("修复进行中…"); return; }
-    this._repairingAv = true;
-    const modal = new AssetOpProgressModal(this.app, this, "🔊 修复思源音视频引用");
-    modal.open();
-    modal.setProgress({ message: "正在查询含音视频图片语法的文档…", current: 0, total: 0 });
+  // ── 推送收尾：音视频写法 + 附件断链一次性搞定 ──
+  async runPostPushRepairs(opts) {
+    opts = opts || {};
+    const onProgress = opts.onProgress || (() => {});
+    const av = await this._doRepairAvMarkup(onProgress);
+    const broken = await this._doRepairBrokenRefs(onProgress);
+    return { av, broken };
+  }
+
+  async _doRepairAvMarkup(onProgress) {
+    onProgress = onProgress || (() => {});
     const avRe = /!\[([^\]]*)\]\((assets\/[^)\s]+\.(?:mp3|wav|flac|ogg|m4a|aac|wma|opus|mp4|webm|mov|mkv|avi|m4v|flv|wmv))\)/gi;
     let scanned = 0;
     let fixed = 0;
     let failed = 0;
-    try {
+    onProgress({ message: "修复音视频：查询候选文档…", current: 0, total: 0 });
+    const rows = await this.api.request("/api/query/sql", {
+      stmt:
+        "SELECT DISTINCT root_id FROM blocks WHERE type='p' AND (" +
+        "markdown LIKE '%](assets/%.mp3)%' OR markdown LIKE '%](assets/%.wav)%' OR " +
+        "markdown LIKE '%](assets/%.m4a)%' OR markdown LIKE '%](assets/%.mp4)%' OR " +
+        "markdown LIKE '%](assets/%.ogg)%' OR markdown LIKE '%](assets/%.flac)%'" +
+        ") LIMIT 5000",
+    });
+    const roots = Array.isArray(rows) ? rows.map(r => r.root_id).filter(Boolean) : [];
+    const uniq = Array.from(new Set(roots));
+    onProgress({
+      message: uniq.length ? `修复音视频：${uniq.length} 篇候选` : "修复音视频：无需处理",
+      current: 0,
+      total: Math.max(1, uniq.length),
+    });
+    for (const id of uniq) {
+      scanned++;
+      onProgress({
+        message: `修复音视频 ${scanned}/${uniq.length}`,
+        current: scanned,
+        total: Math.max(1, uniq.length),
+        detail: `文档 ${id}`,
+        stats: `已修复 ${fixed} · 失败 ${failed}`,
+      });
+      await yieldUi();
+      try {
+        const md = await this.api.getDocMd(id);
+        if (!md || !avRe.test(md)) continue;
+        avRe.lastIndex = 0;
+        const next = md.replace(avRe, (_, alt, p) => formatAssetMarkdown(null, p, alt || null));
+        if (next === md) continue;
+        await this.api.updateDoc(id, next);
+        fixed++;
+      } catch (e) {
+        failed++;
+        console.warn("[SiPush] 修复音视频失败:", id, e.message);
+      }
+    }
+    return { scanned, fixed, failed };
+  }
+
+  async _doRepairBrokenRefs(onProgress) {
+    onProgress = onProgress || (() => {});
+    let pairCount = 0;
+    let docsTouched = 0;
+    let replaceOps = 0;
+    let unresolved = 0;
+
+    onProgress({ message: "修复断链：① 枚举 assets…", current: 0, total: 0 });
+    const files = await this.listSiYuanAssetFiles((info) => {
+      onProgress(typeof info === "string"
+        ? { message: info }
+        : Object.assign({ message: "修复断链：① 枚举 assets…" }, info || {}));
+    });
+    const existing = new Set(files.map(f => f.name));
+    const byFamily = new Map();
+    for (const f of files) {
+      const key = assetFamilyKey(f.name);
+      if (!byFamily.has(key)) byFamily.set(key, []);
+      byFamily.get(key).push(f);
+    }
+    for (const [, list] of byFamily) {
+      list.sort((a, b) => {
+        const ta = (a.created && a.created > 0) ? a.created : assetEarlinessMs(a);
+        const tb = (b.created && b.created > 0) ? b.created : assetEarlinessMs(b);
+        if (ta !== tb) return ta - tb;
+        return String(a.linkPath).localeCompare(String(b.linkPath));
+      });
+    }
+
+    onProgress({ message: "修复断链：② 扫描文档引用…", current: 0, total: 0 });
+    const refPathToDocs = new Map();
+    let offset = 0;
+    const page = 3000;
+    const re = /assets\/([^\s)\]\"'<>]+)/gi;
+    for (let round = 0; round < 40; round++) {
       const rows = await this.api.request("/api/query/sql", {
         stmt:
-          "SELECT DISTINCT root_id FROM blocks WHERE type='p' AND (" +
-          "markdown LIKE '%](assets/%.mp3)%' OR markdown LIKE '%](assets/%.wav)%' OR " +
-          "markdown LIKE '%](assets/%.m4a)%' OR markdown LIKE '%](assets/%.mp4)%' OR " +
-          "markdown LIKE '%](assets/%.ogg)%' OR markdown LIKE '%](assets/%.flac)%'" +
-          ") LIMIT 5000",
+          "SELECT root_id, markdown FROM blocks WHERE markdown LIKE '%assets/%' " +
+          "LIMIT " + page + " OFFSET " + offset,
       });
-      const roots = Array.isArray(rows) ? rows.map(r => r.root_id).filter(Boolean) : [];
-      const uniq = Array.from(new Set(roots));
-      modal.setProgress({
-        message: uniq.length ? `找到 ${uniq.length} 篇候选文档，开始修复…` : "未找到需修复的文档",
-        current: 0,
-        total: Math.max(1, uniq.length),
-        detail: "",
-        stats: "",
-      });
-      for (const id of uniq) {
-        scanned++;
-        modal.setProgress({
-          message: `修复音视频 ${scanned}/${uniq.length}`,
-          current: scanned,
-          total: uniq.length,
-          detail: `文档 ${id}`,
-          stats: `已修复 ${fixed} · 失败 ${failed}`,
-        });
-        await yieldUi();
-        try {
-          const md = await this.api.getDocMd(id);
-          if (!md || !avRe.test(md)) continue;
-          avRe.lastIndex = 0;
-          const next = md.replace(avRe, (_, alt, p) => formatAssetMarkdown(null, p, alt || null));
-          if (next === md) continue;
-          await this.api.updateDoc(id, next);
-          fixed++;
-        } catch (e) {
-          failed++;
-          console.warn("[SiPush] 修复音视频失败:", id, e.message);
+      const list = Array.isArray(rows) ? rows : [];
+      if (!list.length) break;
+      for (const r of list) {
+        const md = r && r.markdown ? String(r.markdown) : "";
+        const rootId = r && r.root_id;
+        if (!rootId || !md) continue;
+        let m;
+        re.lastIndex = 0;
+        while ((m = re.exec(md))) {
+          let full = decodeUriPath(m[0].split("?")[0]);
+          full = normalizeAssetLinkPath(full);
+          const base = full.split("/").pop();
+          if (!base || existing.has(base)) continue;
+          if (!refPathToDocs.has(full)) refPathToDocs.set(full, new Set());
+          refPathToDocs.get(full).add(rootId);
         }
       }
-      this.refreshStatusBar();
-      const doneMsg = `✅ 完成：扫描 ${scanned} · 修复 ${fixed} · 失败 ${failed}`;
-      modal.setProgress({
-        message: doneMsg,
-        current: uniq.length,
-        total: Math.max(1, uniq.length),
-        detail: "",
-        stats: "",
+      offset += list.length;
+      onProgress({
+        message: `修复断链：② 已扫块 ${offset}`,
+        current: round + 1,
+        total: 0,
+        detail: `疑似断链 ${refPathToDocs.size}`,
       });
+      await yieldUi();
+      if (list.length < page) break;
+    }
+
+    const pairs = [];
+    for (const [linkPath, docs] of refPathToDocs) {
+      const name = linkPath.split("/").pop();
+      const key = assetFamilyKey(name);
+      const cands = byFamily.get(key) || [];
+      if (!cands.length) { unresolved++; continue; }
+      const keep = cands[0];
+      pairs.push({
+        from: linkPath,
+        to: keep.linkPath,
+        fromName: name,
+        toName: keep.name,
+        docs: Array.from(docs),
+      });
+    }
+    pairCount = pairs.length;
+
+    if (!pairs.length) {
+      onProgress({
+        message: unresolved
+          ? `修复断链：无可自动修复（无法匹配 ${unresolved}）`
+          : "修复断链：无需处理",
+        current: 1,
+        total: 1,
+      });
+      return { pairCount: 0, docsTouched: 0, replaceOps: 0, unresolved };
+    }
+
+    const touched = new Set();
+    for (let i = 0; i < pairs.length; i++) {
+      const p = pairs[i];
+      onProgress({
+        message: `修复断链 ${i + 1}/${pairs.length}`,
+        current: i + 1,
+        total: pairs.length,
+        detail: `${p.fromName} → ${p.toName}`,
+        stats: `已改文档 ${touched.size} · 无法匹配 ${unresolved}`,
+      });
+      await yieldUi();
+      try {
+        let changed = 0;
+        for (const id of p.docs) {
+          try {
+            let md = await this.api.getDocMd(id);
+            if (!md) continue;
+            if (md.indexOf(p.from) < 0 && md.indexOf(p.fromName) < 0) continue;
+            let next = md.split(p.from).join(p.to);
+            if (next === md) next = md.split(p.fromName).join(p.toName);
+            if (next === md) continue;
+            await this.api.updateDoc(id, next);
+            touched.add(id);
+            changed++;
+            replaceOps++;
+          } catch (e) {
+            console.warn("[SiPush] 断链修复单文档失败:", id, e.message);
+          }
+        }
+        if (!changed) {
+          const rw = await this.api.rewriteAssetRefsInDocs(p.from, p.to);
+          if (rw && rw.changed) {
+            replaceOps += rw.changed;
+            docsTouched += rw.changed;
+          }
+        }
+      } catch (e) {
+        console.warn("[SiPush] 断链修复失败:", p.from, "→", p.to, e.message);
+      }
+    }
+    docsTouched = Math.max(docsTouched, touched.size);
+
+    try {
+      await this.loadAssetIndex();
+      let mapFixed = 0;
+      const fromSet = new Map(pairs.map(p => [normalizeAssetLinkPath(p.from), normalizeAssetLinkPath(p.to)]));
+      for (const store of [this._assetIndex.byVaultPath, this._assetIndex.byHash]) {
+        for (const key of Object.keys(store || {})) {
+          const entry = store[key];
+          if (!entry || !entry.siPath) continue;
+          const cur = normalizeAssetLinkPath(entry.siPath);
+          if (fromSet.has(cur)) {
+            entry.siPath = fromSet.get(cur);
+            mapFixed++;
+            this._assetIndexDirty = true;
+          }
+        }
+      }
+      await this.saveAssetIndex(true);
+      if (mapFixed) console.log("[SiPush] 断链修复同步索引", mapFixed);
+    } catch (e) {
+      console.warn("[SiPush] 断链修复写索引失败:", e.message);
+    }
+
+    onProgress({
+      message: `修复断链完成：路径 ${pairCount} · 文档 ${docsTouched}`,
+      current: pairs.length,
+      total: pairs.length,
+      detail: unresolved ? `无法匹配 ${unresolved}` : "",
+    });
+    return { pairCount, docsTouched, replaceOps, unresolved };
+  }
+
+  // ── 修复思源里被写成图片语法的音视频（显示「找不到」） ──
+  async repairSiYuanAudioVideoMarkup() {
+    if (!this.ensureConfigured()) return;
+    if (this._repairingAv || this._repairingBrokenRefs) { new Notice("修复进行中…"); return; }
+    this._repairingAv = true;
+    const modal = new AssetOpProgressModal(this.app, this, "🔊 修复思源音视频引用");
+    modal.open();
+    try {
+      const r = await this._doRepairAvMarkup((info) => modal.setProgress(info));
+      const doneMsg = `✅ 完成：扫描 ${r.scanned} · 修复 ${r.fixed} · 失败 ${r.failed}`;
+      modal.setProgress({ message: doneMsg, current: r.scanned || 1, total: Math.max(1, r.scanned) });
       modal.markDone(doneMsg);
       new Notice(doneMsg, 8000);
     } catch (e) {
@@ -4034,6 +4543,35 @@ class SiPushPlugin extends Plugin {
       new Notice("❌ 修复失败: " + e.message, 8000);
     } finally {
       this._repairingAv = false;
+      this.refreshStatusBar();
+    }
+  }
+
+  /**
+   * 修复「文档仍引用已删副本」的断链（也可由推送收尾自动执行）
+   */
+  async repairBrokenAssetRefs() {
+    if (!this.ensureConfigured()) return;
+    if (this._repairingBrokenRefs || this._repairingAv) { new Notice("修复进行中…"); return; }
+    this._repairingBrokenRefs = true;
+    const modal = new AssetOpProgressModal(this.app, this, "🔗 修复附件断链");
+    modal.open();
+    try {
+      const r = await this._doRepairBrokenRefs((info) => modal.setProgress(info));
+      const doneMsg = r.pairCount
+        ? `✅ 断链修复完成：路径 ${r.pairCount} · 文档 ${r.docsTouched} · 替换 ${r.replaceOps}` +
+          (r.unresolved ? ` · 无法匹配 ${r.unresolved}` : "")
+        : (r.unresolved
+          ? `未找到可自动修复的断链（另有 ${r.unresolved} 条无同族文件可匹配）`
+          : "✅ 未发现附件断链，无需修复");
+      modal.setProgress({ message: doneMsg, current: 1, total: 1 });
+      modal.markDone(doneMsg);
+      new Notice(doneMsg, 10000);
+    } catch (e) {
+      modal.markDone("❌ 断链修复失败: " + e.message);
+      new Notice("❌ 断链修复失败: " + e.message, 8000);
+    } finally {
+      this._repairingBrokenRefs = false;
       this.refreshStatusBar();
     }
   }
@@ -4336,13 +4874,22 @@ class SiPushSettingTab extends PluginSettingTab {
         this.display();
       }));
 
+    new Setting(containerEl).setName("推送结束自动修复")
+      .setDesc("推送完成后自动：① 音视频 ![]→播放器 ② 附件断链改到仍存在的文件。一般不用再单独点修复")
+      .addToggle(t => t.setValue(this.plugin.settings.autoRepairAfterPush !== false)
+        .onChange(async v => { this.plugin.settings.autoRepairAfterPush = v; await this.plugin.saveSettings(); }));
+
     new Setting(containerEl).setName("去重思源资源池")
       .setDesc("只删重复副本（同内容/同族同大小多份里留最早一份）；不会因为「未被引用」而删除独立文件")
       .addButton(b => b.setButtonText("开始去重").setCta().onClick(() => this.plugin.openAssetDedup()));
 
+    new Setting(containerEl).setName("修复附件断链")
+      .setDesc("去重后若文档仍指向已删副本：按文件名族改到仍存在的那份（推送结束默认也会自动跑）")
+      .addButton(b => b.setButtonText("一键修复").onClick(() => this.plugin.repairBrokenAssetRefs()));
+
     new Setting(containerEl).setName("修复音视频引用")
-      .setDesc("把思源里误写成 ![](assets/xxx.mp3) 的引用改成播放器（解决「找不到」）")
-      .addButton(b => b.setButtonText("立即修复").setCta().onClick(() => this.plugin.repairSiYuanAudioVideoMarkup()));
+      .setDesc("把误写成 ![](assets/xxx.mp3) 的改成播放器（推送结束默认也会自动跑）")
+      .addButton(b => b.setButtonText("立即修复").onClick(() => this.plugin.repairSiYuanAudioVideoMarkup()));
 
     new Setting(containerEl).setName("转换双链")
       .setDesc("将 [[笔记]] 转为思源块引用 ((文档ID \"显示名\"))，才能在思源里点击跳转")
